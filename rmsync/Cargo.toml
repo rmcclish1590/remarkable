@@ -1,0 +1,52 @@
+[package]
+name = "rmsync"
+version = "0.1.0"
+edition = "2021"
+description = "Bi-directional sync for reMarkable 2 tablets on Linux"
+license = "MIT"
+
+[dependencies]
+# UI
+gtk = { version = "0.9", package = "gtk4", features = ["v4_6"] }
+libadwaita = { version = "0.7", features = ["v1_2"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# SSH/SFTP
+russh = "0.46"
+russh-sftp = "2"
+
+# USB detection
+udev = "0.9"
+
+# File watching
+notify = "7"
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Binary parsing
+nom = "7"
+
+# SVG
+resvg = "0.44"
+
+# Hashing
+sha2 = "0.10"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Unique IDs
+uuid = { version = "1", features = ["v4"] }
