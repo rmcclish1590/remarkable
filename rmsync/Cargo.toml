@@ -16,6 +16,13 @@ tokio = { version = "1", features = ["full"] }
 # SSH/SFTP
 russh = "0.46"
 russh-sftp = "2"
+russh-keys = "0.46"
+async-trait = "0.1"
+ssh-key = { version = "0.6", features = ["ed25519"] }
+rand = "0.8"
+
+# Config paths
+dirs = "5"
 
 # USB detection
 udev = "0.9"
