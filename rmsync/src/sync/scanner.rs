@@ -4,6 +4,7 @@
 //! SFTP, parses each document's metadata/content, and returns a manifest with
 //! deterministic content hashes. Spec 09 adds the local counterpart.
 
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -11,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::device::connection::{DeviceConnection, RemoteFileInfo};
 use crate::remarkable::metadata::{RemarkableContent, RemarkableMetadata};
+use crate::sync::state_db::SyncFileState;
 
 pub const XOCHITL_PATH: &str = "/home/root/.local/share/remarkable/xochitl";
 
@@ -212,6 +214,244 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+// =========================================================================
+// Local scanner (spec 09)
+// =========================================================================
+
+/// Subdirectory under the user's sync destination that mirrors the tablet's
+/// xochitl tree.
+pub const RAW_SUBDIR: &str = "raw";
+
+#[derive(Debug, Clone)]
+pub struct LocalFileInfo {
+    pub path: PathBuf,
+    pub name: String,
+    pub size: u64,
+    pub mtime: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalDocumentSnapshot {
+    pub uuid: String,
+    pub metadata: RemarkableMetadata,
+    pub content: Option<RemarkableContent>,
+    pub content_hash: String,
+    pub total_size_bytes: u64,
+    pub mtime: u64,
+    pub page_count: usize,
+    pub has_pdf: bool,
+    pub file_list: Vec<LocalFileInfo>,
+}
+
+#[derive(Debug)]
+pub struct LocalManifest {
+    pub documents: Vec<LocalDocumentSnapshot>,
+    pub scanned_at: u64,
+    pub total_documents: usize,
+    pub total_size_bytes: u64,
+    pub sync_dir: PathBuf,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ChangeType {
+    Unchanged,
+    ModifiedLocally,
+    ModifiedRemotely,
+    ModifiedBoth,
+    NewLocal,
+    NewRemote,
+    DeletedLocally,
+    DeletedRemotely,
+}
+
+pub fn get_watch_paths(sync_dir: &Path) -> Vec<PathBuf> {
+    vec![sync_dir.join(RAW_SUBDIR)]
+}
+
+pub fn scan_local(sync_dir: &Path) -> Result<LocalManifest> {
+    let raw = sync_dir.join(RAW_SUBDIR);
+    if !raw.exists() {
+        std::fs::create_dir_all(&raw)
+            .with_context(|| format!("creating {}", raw.display()))?;
+        return Ok(LocalManifest {
+            documents: vec![],
+            scanned_at: now_unix(),
+            total_documents: 0,
+            total_size_bytes: 0,
+            sync_dir: sync_dir.to_path_buf(),
+        });
+    }
+
+    let mut uuids = Vec::new();
+    for entry in std::fs::read_dir(&raw)? {
+        let entry = entry?;
+        if let Some(name) = entry.file_name().to_str() {
+            if let Some(u) = name.strip_suffix(".metadata") {
+                uuids.push(u.to_string());
+            }
+        }
+    }
+    uuids.sort();
+
+    let mut documents = Vec::new();
+    let mut total_size = 0u64;
+    for uuid in &uuids {
+        match build_local_snapshot(&raw, uuid)? {
+            Some(snap) => {
+                total_size += snap.total_size_bytes;
+                documents.push(snap);
+            }
+            None => {}
+        }
+    }
+
+    Ok(LocalManifest {
+        total_documents: documents.len(),
+        total_size_bytes: total_size,
+        documents,
+        scanned_at: now_unix(),
+        sync_dir: sync_dir.to_path_buf(),
+    })
+}
+
+fn build_local_snapshot(raw: &Path, uuid: &str) -> Result<Option<LocalDocumentSnapshot>> {
+    let meta_path = raw.join(format!("{uuid}.metadata"));
+    let metadata = RemarkableMetadata::from_file(&meta_path)?;
+    if metadata.is_deleted() {
+        return Ok(None);
+    }
+
+    let content_path = raw.join(format!("{uuid}.content"));
+    let content = if content_path.exists() {
+        RemarkableContent::from_file(&content_path).ok()
+    } else {
+        None
+    };
+
+    let mut file_list = Vec::new();
+    for entry in std::fs::read_dir(raw)? {
+        let entry = entry?;
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        if fname.starts_with(&format!("{uuid}.")) {
+            if let Ok(info) = local_info(&entry.path(), &fname) {
+                file_list.push(info);
+            }
+        }
+    }
+    let subdir = raw.join(uuid);
+    if subdir.is_dir() {
+        for entry in std::fs::read_dir(&subdir)? {
+            let entry = entry?;
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            if let Ok(info) = local_info(&entry.path(), &fname) {
+                file_list.push(info);
+            }
+        }
+    }
+
+    let page_count = file_list.iter().filter(|f| f.name.ends_with(".rm")).count();
+    let has_pdf = file_list.iter().any(|f| f.name.ends_with(".pdf"));
+    let total_size_bytes = file_list.iter().map(|f| f.size).sum();
+    let mtime = file_list.iter().map(|f| f.mtime).max().unwrap_or(0);
+    let content_hash = compute_local_hash(uuid, &file_list, raw)?;
+
+    Ok(Some(LocalDocumentSnapshot {
+        uuid: uuid.to_string(),
+        metadata,
+        content,
+        content_hash,
+        total_size_bytes,
+        mtime,
+        page_count,
+        has_pdf,
+        file_list,
+    }))
+}
+
+fn local_info(path: &Path, name: &str) -> Result<LocalFileInfo> {
+    let md = std::fs::metadata(path)?;
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Ok(LocalFileInfo {
+        path: path.to_path_buf(),
+        name: name.to_string(),
+        size: md.len(),
+        mtime,
+    })
+}
+
+pub fn compute_local_hash(
+    _uuid: &str,
+    files: &[LocalFileInfo],
+    raw_dir: &Path,
+) -> Result<String> {
+    let mut sorted: Vec<&LocalFileInfo> = files.iter().collect();
+    sorted.sort_by(|a, b| {
+        let ra = a.path.strip_prefix(raw_dir).unwrap_or(&a.path);
+        let rb = b.path.strip_prefix(raw_dir).unwrap_or(&b.path);
+        ra.cmp(rb)
+    });
+
+    let mut hasher = Sha256::new();
+    for f in sorted {
+        let rel = f.path.strip_prefix(raw_dir).unwrap_or(&f.path);
+        let rel_str = rel.to_string_lossy();
+        hasher.update(rel_str.as_bytes());
+        hasher.update([0u8]);
+        if f.size <= FULL_HASH_THRESHOLD {
+            match std::fs::read(&f.path) {
+                Ok(bytes) => hasher.update(&bytes),
+                Err(_) => hasher.update(format!("stat:{}:{}", f.size, f.mtime).as_bytes()),
+            }
+        } else {
+            hasher.update(format!("stat:{}:{}", f.size, f.mtime).as_bytes());
+        }
+        hasher.update([0u8]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+pub fn classify_change(
+    local: Option<&LocalDocumentSnapshot>,
+    remote: Option<&RemoteDocumentSnapshot>,
+    synced: Option<&SyncFileState>,
+) -> ChangeType {
+    match (local, remote, synced) {
+        (None, None, _) => ChangeType::Unchanged,
+        (Some(_), None, None) => ChangeType::NewLocal,
+        (None, Some(_), None) => ChangeType::NewRemote,
+        (Some(_), None, Some(_)) => ChangeType::DeletedRemotely,
+        (None, Some(_), Some(_)) => ChangeType::DeletedLocally,
+        (Some(l), Some(r), None) => {
+            if l.content_hash == r.content_hash {
+                ChangeType::Unchanged
+            } else {
+                ChangeType::ModifiedBoth
+            }
+        }
+        (Some(l), Some(r), Some(s)) => {
+            let local_changed = s.synced_hash.as_deref() != Some(l.content_hash.as_str());
+            let remote_changed = s.synced_hash.as_deref() != Some(r.content_hash.as_str());
+            match (local_changed, remote_changed) {
+                (false, false) => ChangeType::Unchanged,
+                (true, false) => ChangeType::ModifiedLocally,
+                (false, true) => ChangeType::ModifiedRemotely,
+                (true, true) => {
+                    if l.content_hash == r.content_hash {
+                        ChangeType::Unchanged
+                    } else {
+                        ChangeType::ModifiedBoth
+                    }
+                }
+            }
+        }
+    }
+}
+
 mod hex {
     pub fn encode(bytes: impl AsRef<[u8]>) -> String {
         let bytes = bytes.as_ref();
@@ -314,5 +554,214 @@ mod tests {
     #[test]
     fn xochitl_path_constant() {
         assert!(XOCHITL_PATH.ends_with("/xochitl"));
+    }
+
+    // --- local scanner (spec 09) ---
+
+    use crate::sync::state_db::{SyncFileState, SyncStatus};
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn write_doc(raw: &Path, uuid: &str, name: &str, rm_content: &[u8]) {
+        let meta = format!(
+            r#"{{
+                "deleted": false,
+                "lastModified": "1",
+                "parent": "",
+                "pinned": false,
+                "type": "DocumentType",
+                "visibleName": "{name}"
+            }}"#
+        );
+        fs::write(raw.join(format!("{uuid}.metadata")), meta).unwrap();
+        let content = r#"{"fileType":"notebook","pageCount":1,"pages":["p1"]}"#;
+        fs::write(raw.join(format!("{uuid}.content")), content).unwrap();
+        let pages = raw.join(uuid);
+        fs::create_dir_all(&pages).unwrap();
+        fs::write(pages.join("p1.rm"), rm_content).unwrap();
+    }
+
+    #[test]
+    fn scan_local_empty_dir_returns_empty_manifest() {
+        let dir = tempdir().unwrap();
+        let m = scan_local(dir.path()).unwrap();
+        assert_eq!(m.total_documents, 0);
+        assert!(dir.path().join("raw").exists());
+    }
+
+    #[test]
+    fn scan_local_single_doc_populates_snapshot() {
+        let dir = tempdir().unwrap();
+        let raw = dir.path().join("raw");
+        fs::create_dir_all(&raw).unwrap();
+        write_doc(&raw, "abc", "Hello", b"pagebytes");
+        let m = scan_local(dir.path()).unwrap();
+        assert_eq!(m.total_documents, 1);
+        let d = &m.documents[0];
+        assert_eq!(d.uuid, "abc");
+        assert_eq!(d.metadata.visible_name, "Hello");
+        assert_eq!(d.page_count, 1);
+        assert!(!d.has_pdf);
+        assert!(!d.content_hash.is_empty());
+    }
+
+    #[test]
+    fn local_hash_is_deterministic() {
+        let dir = tempdir().unwrap();
+        let raw = dir.path().join("raw");
+        fs::create_dir_all(&raw).unwrap();
+        write_doc(&raw, "abc", "Same", b"aaaa");
+        let m1 = scan_local(dir.path()).unwrap();
+        let m2 = scan_local(dir.path()).unwrap();
+        assert_eq!(m1.documents[0].content_hash, m2.documents[0].content_hash);
+    }
+
+    #[test]
+    fn local_hash_changes_when_file_changes() {
+        let dir = tempdir().unwrap();
+        let raw = dir.path().join("raw");
+        fs::create_dir_all(&raw).unwrap();
+        write_doc(&raw, "abc", "Same", b"aaaa");
+        let h1 = scan_local(dir.path()).unwrap().documents[0].content_hash.clone();
+        fs::write(raw.join("abc").join("p1.rm"), b"bbbb").unwrap();
+        let h2 = scan_local(dir.path()).unwrap().documents[0].content_hash.clone();
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn deleted_local_doc_excluded() {
+        let dir = tempdir().unwrap();
+        let raw = dir.path().join("raw");
+        fs::create_dir_all(&raw).unwrap();
+        fs::write(
+            raw.join("xxx.metadata"),
+            r#"{"deleted":true,"lastModified":"1","parent":"","pinned":false,"type":"DocumentType","visibleName":"g"}"#,
+        )
+        .unwrap();
+        let m = scan_local(dir.path()).unwrap();
+        assert_eq!(m.total_documents, 0);
+    }
+
+    fn mk_local(hash: &str) -> LocalDocumentSnapshot {
+        LocalDocumentSnapshot {
+            uuid: "u".into(),
+            metadata: serde_json::from_str(
+                r#"{"deleted":false,"lastModified":"1","parent":"","pinned":false,"type":"DocumentType","visibleName":"x"}"#,
+            )
+            .unwrap(),
+            content: None,
+            content_hash: hash.into(),
+            total_size_bytes: 0,
+            mtime: 0,
+            page_count: 0,
+            has_pdf: false,
+            file_list: vec![],
+        }
+    }
+    fn mk_remote(hash: &str) -> RemoteDocumentSnapshot {
+        RemoteDocumentSnapshot {
+            uuid: "u".into(),
+            metadata: serde_json::from_str(
+                r#"{"deleted":false,"lastModified":"1","parent":"","pinned":false,"type":"DocumentType","visibleName":"x"}"#,
+            )
+            .unwrap(),
+            content: None,
+            content_hash: hash.into(),
+            total_size_bytes: 0,
+            mtime: 0,
+            page_count: 0,
+            has_pdf: false,
+            file_list: vec![],
+        }
+    }
+    fn mk_synced(hash: &str) -> SyncFileState {
+        SyncFileState {
+            uuid: "u".into(),
+            visible_name: "x".into(),
+            parent_uuid: String::new(),
+            doc_type: "DocumentType".into(),
+            local_hash: Some(hash.into()),
+            remote_hash: Some(hash.into()),
+            synced_hash: Some(hash.into()),
+            local_mtime: None,
+            remote_mtime: None,
+            synced_mtime: None,
+            last_sync_at: None,
+            sync_status: SyncStatus::Synced,
+            conflict_info: None,
+        }
+    }
+
+    #[test]
+    fn classify_unchanged() {
+        let l = mk_local("h1");
+        let r = mk_remote("h1");
+        let s = mk_synced("h1");
+        assert_eq!(
+            classify_change(Some(&l), Some(&r), Some(&s)),
+            ChangeType::Unchanged
+        );
+    }
+
+    #[test]
+    fn classify_modified_locally() {
+        let l = mk_local("h2");
+        let r = mk_remote("h1");
+        let s = mk_synced("h1");
+        assert_eq!(
+            classify_change(Some(&l), Some(&r), Some(&s)),
+            ChangeType::ModifiedLocally
+        );
+    }
+
+    #[test]
+    fn classify_modified_remotely() {
+        let l = mk_local("h1");
+        let r = mk_remote("h2");
+        let s = mk_synced("h1");
+        assert_eq!(
+            classify_change(Some(&l), Some(&r), Some(&s)),
+            ChangeType::ModifiedRemotely
+        );
+    }
+
+    #[test]
+    fn classify_modified_both() {
+        let l = mk_local("h2");
+        let r = mk_remote("h3");
+        let s = mk_synced("h1");
+        assert_eq!(
+            classify_change(Some(&l), Some(&r), Some(&s)),
+            ChangeType::ModifiedBoth
+        );
+    }
+
+    #[test]
+    fn classify_new_local_and_remote() {
+        let l = mk_local("h1");
+        let r = mk_remote("h1");
+        assert_eq!(classify_change(Some(&l), None, None), ChangeType::NewLocal);
+        assert_eq!(classify_change(None, Some(&r), None), ChangeType::NewRemote);
+    }
+
+    #[test]
+    fn classify_deleted_sides() {
+        let l = mk_local("h1");
+        let r = mk_remote("h1");
+        let s = mk_synced("h1");
+        assert_eq!(
+            classify_change(Some(&l), None, Some(&s)),
+            ChangeType::DeletedRemotely
+        );
+        assert_eq!(
+            classify_change(None, Some(&r), Some(&s)),
+            ChangeType::DeletedLocally
+        );
+    }
+
+    #[test]
+    fn watch_paths_returns_raw() {
+        let paths = get_watch_paths(Path::new("/sync"));
+        assert_eq!(paths, vec![PathBuf::from("/sync/raw")]);
     }
 }
