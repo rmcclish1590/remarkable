@@ -12,6 +12,7 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::config::AppConfig;
+use crate::ui::sync_controls::setup_folder_selector;
 use crate::ui::window::MainWindow;
 
 pub const APP_ID: &str = "com.rmsync.app";
@@ -32,6 +33,12 @@ impl RmSyncApp {
         app.connect_activate(move |app| {
             let cfg = config_for_activate.borrow().clone();
             let main = MainWindow::new(app, &cfg);
+            setup_folder_selector(
+                &main.browse_button,
+                &main.sync_path_entry,
+                &main.window,
+                config_for_activate.clone(),
+            );
             let config_for_close = config_for_activate.clone();
             let window = main.window.clone();
             let paned = main.paned.clone();
