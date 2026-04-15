@@ -71,7 +71,14 @@ pub async fn pull_document(
     let mut first_err: Option<String> = None;
 
     for f in &remote_files {
-        let local_path = local_path_for(&raw, uuid, &f.path);
+        let local_path = match safe_local_path_for(&raw, uuid, &f.path) {
+            Some(p) => p,
+            None => {
+                tracing::warn!("rejecting unsafe remote path for {uuid}: {}", f.path);
+                first_err.get_or_insert_with(|| format!("rejected unsafe path: {}", f.path));
+                continue;
+            }
+        };
         if let Some(parent) = local_path.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
                 first_err = Some(format!("mkdir {}: {e}", parent.display()));
@@ -130,6 +137,62 @@ fn local_path_for(raw: &Path, uuid: &str, remote_path: &str) -> PathBuf {
     let top_prefix = format!("{XOCHITL_PATH}/");
     let rel = remote_path.strip_prefix(&top_prefix).unwrap_or(remote_path);
     raw.join(rel)
+}
+
+/// Validate a uuid-like identifier: hex digits and `-` only, length-bounded.
+/// Rejects anything that could escape a path component or pollute globs.
+fn is_safe_uuid(uuid: &str) -> bool {
+    !uuid.is_empty()
+        && uuid.len() <= 64
+        && uuid.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+}
+
+/// Validate that a single path component (name between `/`s) is safe to use
+/// as a filesystem path component. Rejects `.`, `..`, empty, `/` embedded,
+/// NUL bytes, and leading dots (so adversarial dotfiles can't appear).
+fn is_safe_component(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.starts_with('.')
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+}
+
+/// Resolve an attacker-controlled remote path to a local path beneath `raw`,
+/// rejecting anything that tries to escape. Returns `None` on any anomaly so
+/// the caller can log and skip. A malicious tablet cannot be trusted to
+/// return paths that stay inside `XOCHITL_PATH` — every component is
+/// validated.
+fn safe_local_path_for(raw: &Path, uuid: &str, remote_path: &str) -> Option<PathBuf> {
+    if !is_safe_uuid(uuid) {
+        return None;
+    }
+    let subdir_prefix = format!("{XOCHITL_PATH}/{uuid}/");
+    let top_prefix = format!("{XOCHITL_PATH}/");
+    let (base, rel) = if let Some(rel) = remote_path.strip_prefix(&subdir_prefix) {
+        (raw.join(uuid), rel)
+    } else if let Some(rel) = remote_path.strip_prefix(&top_prefix) {
+        (raw.to_path_buf(), rel)
+    } else {
+        return None;
+    };
+    if rel.is_empty() || rel.contains('\0') {
+        return None;
+    }
+    let mut out = base;
+    for component in rel.split('/') {
+        if !is_safe_component(component) {
+            return None;
+        }
+        out.push(component);
+    }
+    // Defence in depth: confirm the resolved path still lies under raw/.
+    if !out.starts_with(raw) {
+        return None;
+    }
+    Some(out)
 }
 
 async fn download_atomic(
@@ -519,17 +582,38 @@ async fn pull_document_to_backup(
 ) -> Result<()> {
     let raw = sync_dir.join(RAW_SUBDIR);
     tokio::fs::create_dir_all(&raw).await?;
+    if !is_safe_uuid(uuid) || !is_safe_uuid(backup_uuid) {
+        return Err(anyhow::anyhow!(
+            "refusing to pull backup for unsafe uuid {uuid} / {backup_uuid}"
+        ));
+    }
     let remote_files = list_remote_files_for_uuid(conn, uuid).await?;
     for f in &remote_files {
-        let subdir_prefix = format!("{XOCHITL_PATH}/{uuid}/");
-        let local_path = if let Some(rel) = f.path.strip_prefix(&subdir_prefix) {
-            raw.join(backup_uuid).join(rel)
-        } else {
-            let top_prefix = format!("{XOCHITL_PATH}/");
-            let name = f.path.strip_prefix(&top_prefix).unwrap_or(&f.path);
-            let remapped = name.replacen(uuid, backup_uuid, 1);
-            raw.join(remapped)
+        // Resolve the remote path safely under the ORIGINAL uuid first, then
+        // rebase onto backup_uuid. Skip anything a malicious tablet tries to
+        // smuggle outside raw/.
+        let safe = match safe_local_path_for(&raw, uuid, &f.path) {
+            Some(p) => p,
+            None => {
+                tracing::warn!("rejecting unsafe backup remote path: {}", f.path);
+                continue;
+            }
         };
+        // `safe` is guaranteed to live under `raw` (and under `raw/{uuid}`
+        // or `raw/` directly). Rebase by replacing the uuid component(s).
+        let rel = safe.strip_prefix(&raw).expect("safe_local_path_for guarantees prefix");
+        let mut remapped = raw.clone();
+        for component in rel.components() {
+            let s = component.as_os_str().to_string_lossy();
+            if s == uuid {
+                remapped.push(backup_uuid);
+            } else if s.starts_with(&format!("{uuid}.")) {
+                remapped.push(format!("{backup_uuid}.{}", &s[uuid.len() + 1..]));
+            } else {
+                remapped.push(component);
+            }
+        }
+        let local_path = remapped;
         if let Some(parent) = local_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -647,6 +731,80 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn safe_local_path_rejects_parent_traversal_in_rel() {
+        let raw = Path::new("/sync/raw");
+        let malicious = format!("{XOCHITL_PATH}/../../../etc/passwd");
+        assert!(safe_local_path_for(raw, "abc", &malicious).is_none());
+    }
+
+    #[test]
+    fn safe_local_path_rejects_dotdot_component_after_uuid() {
+        let raw = Path::new("/sync/raw");
+        let malicious = format!("{XOCHITL_PATH}/abc/../../../../etc/passwd");
+        assert!(safe_local_path_for(raw, "abc", &malicious).is_none());
+    }
+
+    #[test]
+    fn safe_local_path_rejects_absolute_foreign_path() {
+        let raw = Path::new("/sync/raw");
+        assert!(safe_local_path_for(raw, "abc", "/etc/passwd").is_none());
+    }
+
+    #[test]
+    fn safe_local_path_rejects_dotfile_component() {
+        let raw = Path::new("/sync/raw");
+        let malicious = format!("{XOCHITL_PATH}/.ssh/authorized_keys");
+        assert!(safe_local_path_for(raw, "abc", &malicious).is_none());
+    }
+
+    #[test]
+    fn safe_local_path_rejects_nul_byte() {
+        let raw = Path::new("/sync/raw");
+        let malicious = format!("{XOCHITL_PATH}/abc/evil\0name");
+        assert!(safe_local_path_for(raw, "abc", &malicious).is_none());
+    }
+
+    #[test]
+    fn safe_local_path_rejects_non_hex_uuid() {
+        let raw = Path::new("/sync/raw");
+        let p = format!("{XOCHITL_PATH}/../evil.metadata");
+        assert!(safe_local_path_for(raw, "../evil", &p).is_none());
+    }
+
+    #[test]
+    fn safe_local_path_accepts_legitimate_top_level_file() {
+        let raw = Path::new("/sync/raw");
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let p = format!("{XOCHITL_PATH}/{uuid}.metadata");
+        assert_eq!(
+            safe_local_path_for(raw, uuid, &p),
+            Some(PathBuf::from(format!("/sync/raw/{uuid}.metadata")))
+        );
+    }
+
+    #[test]
+    fn safe_local_path_accepts_legitimate_subdir_page() {
+        let raw = Path::new("/sync/raw");
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let p = format!("{XOCHITL_PATH}/{uuid}/p1.rm");
+        assert_eq!(
+            safe_local_path_for(raw, uuid, &p),
+            Some(PathBuf::from(format!("/sync/raw/{uuid}/p1.rm")))
+        );
+    }
+
+    #[test]
+    fn is_safe_uuid_accepts_hex_dash_rejects_other() {
+        assert!(is_safe_uuid("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(is_safe_uuid("abc123"));
+        assert!(!is_safe_uuid(""));
+        assert!(!is_safe_uuid(".."));
+        assert!(!is_safe_uuid("../evil"));
+        assert!(!is_safe_uuid("abc/def"));
+        assert!(!is_safe_uuid("abc.def"));
+    }
+
+    #[test]
     fn local_path_maps_top_level_file() {
         let raw = Path::new("/sync/raw");
         let out = local_path_for(raw, "abc", &format!("{XOCHITL_PATH}/abc.metadata"));
@@ -758,5 +916,44 @@ mod tests {
         tokio::fs::write(&tmp, b"partial").await.unwrap();
         cleanup_tmp(&local).await;
         assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn copy_local_as_backup_preserves_user_work_and_renames_metadata() {
+        // Conflict-resolution backup path: when remote wins we MUST preserve
+        // the user's local copy byte-for-byte (page files) and rewrite only
+        // the visibleName in metadata. A bug here silently destroys work.
+        let dir = tempdir().unwrap();
+        let raw = dir.path();
+        let meta = r#"{"deleted":false,"lastModified":"1","parent":"p","pinned":false,"type":"DocumentType","visibleName":"Original"}"#;
+        std::fs::write(raw.join("abc.metadata"), meta).unwrap();
+        std::fs::write(raw.join("abc.content"), b"content-bytes").unwrap();
+        std::fs::create_dir_all(raw.join("abc")).unwrap();
+        std::fs::write(raw.join("abc/p1.rm"), b"page-1-bytes").unwrap();
+        std::fs::write(raw.join("other.metadata"), b"untouched").unwrap();
+
+        copy_local_as_backup(raw, "abc", "backup-uuid", "Original (conflict)").unwrap();
+
+        // Original files must be untouched — this is the user's preserved copy.
+        assert_eq!(std::fs::read(raw.join("abc.content")).unwrap(), b"content-bytes");
+        assert_eq!(std::fs::read(raw.join("abc/p1.rm")).unwrap(), b"page-1-bytes");
+        assert_eq!(std::fs::read(raw.join("other.metadata")).unwrap(), b"untouched");
+
+        // Page files must be copied byte-for-byte under the backup uuid.
+        assert_eq!(
+            std::fs::read(raw.join("backup-uuid/p1.rm")).unwrap(),
+            b"page-1-bytes"
+        );
+        assert_eq!(
+            std::fs::read(raw.join("backup-uuid.content")).unwrap(),
+            b"content-bytes"
+        );
+
+        // Metadata must carry the new visibleName and still be valid JSON.
+        let backup_meta: RemarkableMetadata =
+            serde_json::from_slice(&std::fs::read(raw.join("backup-uuid.metadata")).unwrap())
+                .unwrap();
+        assert_eq!(backup_meta.visible_name, "Original (conflict)");
+        assert_eq!(backup_meta.parent, "p");
     }
 }
