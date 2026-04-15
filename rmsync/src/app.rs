@@ -15,13 +15,28 @@ use gtk::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
+use std::sync::OnceLock;
+
+use tokio::runtime::Runtime;
+
 use crate::config::AppConfig;
+use crate::device::monitor::{DeviceEvent, DeviceMonitor};
 use crate::remarkable::document::DocumentTree;
 use crate::sync::engine::{SyncOrchestrator, SyncPhase, SyncProgressEvent};
+use crate::ui::device_status::DeviceStatusWidget;
 use crate::ui::folder_browser::FolderBrowser;
 use crate::ui::sync_controls::{setup_folder_selector, SyncControls};
 use crate::ui::viewer::DocumentViewer;
 use crate::ui::window::MainWindow;
+
+/// Shared tokio runtime for background subscriptions (device monitor event
+/// forwarding). The per-sync orchestrator runs on its own std::thread +
+/// current-thread runtime since rusqlite is !Sync.
+static MONITOR_RT: OnceLock<Runtime> = OnceLock::new();
+
+fn monitor_runtime() -> &'static Runtime {
+    MONITOR_RT.get_or_init(|| Runtime::new().expect("build monitor tokio runtime"))
+}
 
 pub const APP_ID: &str = "com.rmsync.app";
 
@@ -59,6 +74,11 @@ impl RmSyncApp {
                 &main.viewer,
                 main.last_sync_label.clone(),
                 config_for_activate.clone(),
+            );
+            setup_device_monitoring(
+                &main.device_status,
+                &main.sync_controls,
+                &cfg,
             );
             let config_for_close = config_for_activate.clone();
             let window = main.window.clone();
@@ -246,6 +266,64 @@ fn phase_label(phase: &SyncPhase) -> &'static str {
         SyncPhase::Deleting => "Applying deletes...",
         SyncPhase::Finalizing => "Finalising...",
     }
+}
+
+/// Create a DeviceMonitor, bind the status widget, and forward connect/
+/// disconnect events to the sync controls. Also kicks off a one-shot
+/// check_now so the UI reflects current state at startup.
+pub(crate) fn setup_device_monitoring(
+    device_status: &DeviceStatusWidget,
+    sync_controls: &SyncControls,
+    config: &AppConfig,
+) {
+    let conn_config = config.to_connection_config();
+    let auto_sync = config.sync.auto_sync_on_connect;
+    let runtime = monitor_runtime();
+
+    // Build the monitor on the tokio runtime, then bubble two streams back
+    // to the GTK main thread: one for the status widget (all events) and
+    // one for the sync controls (connect/disconnect).
+    let (event_tx_status, event_rx_status) = async_channel::unbounded::<DeviceEvent>();
+    let (event_tx_sync, event_rx_sync) = async_channel::unbounded::<DeviceEvent>();
+
+    runtime.spawn(async move {
+        let (monitor, _rx) = DeviceMonitor::new(conn_config);
+        let mut subscriber = monitor.subscribe();
+        monitor.check_now().await;
+        monitor.start();
+        while let Ok(ev) = subscriber.recv().await {
+            let _ = event_tx_status.send(ev.clone()).await;
+            let _ = event_tx_sync.send(ev).await;
+        }
+    });
+
+    let status = device_status.clone();
+    glib::spawn_future_local(async move {
+        while let Ok(ev) = event_rx_status.recv().await {
+            status.apply_event(ev);
+        }
+    });
+
+    let controls = sync_controls.clone();
+    glib::spawn_future_local(async move {
+        while let Ok(ev) = event_rx_sync.recv().await {
+            match ev {
+                DeviceEvent::Connected => {
+                    controls.set_device_connected(true);
+                    if auto_sync && !controls.is_syncing() {
+                        controls.sync_button.emit_clicked();
+                    }
+                }
+                DeviceEvent::Disconnected => {
+                    controls.set_device_connected(false);
+                }
+                DeviceEvent::UsbDetected => {}
+                DeviceEvent::ConnectionFailed(reason) => {
+                    tracing::warn!("device connection failed: {reason}");
+                }
+            }
+        }
+    });
 }
 
 fn now_unix() -> u64 {

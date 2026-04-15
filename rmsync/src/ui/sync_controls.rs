@@ -168,6 +168,10 @@ impl SyncControls {
         }
     }
 
+    pub fn is_syncing(&self) -> bool {
+        matches!(*self.state.borrow(), SyncUiState::Syncing)
+    }
+
     pub fn state(&self) -> SyncUiState {
         *self.state.borrow()
     }
