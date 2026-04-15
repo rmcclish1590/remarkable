@@ -6,6 +6,11 @@
 //! `DeviceConnection` would require a trait-based refactor of the
 //! transfer layer and is out of scope for this test harness.
 
+// Each integration-test binary compiles `common` independently; helpers
+// used by one binary but not another would otherwise show up as dead
+// code. Silence those to keep the module genuinely shared.
+#![allow(dead_code)]
+
 use std::fs;
 use std::path::Path;
 

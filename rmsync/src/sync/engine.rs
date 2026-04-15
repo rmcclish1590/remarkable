@@ -330,11 +330,10 @@ fn conflict_date_string(unix: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-pub fn civil_from_days_public(days_since_epoch: i64) -> (i32, u32, u32) {
-    civil_from_days(days_since_epoch)
-}
-
-fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
+/// Convert days-since-unix-epoch to a `(year, month, day)` tuple using
+/// Howard Hinnant's algorithm — cheaper than pulling in `chrono` for two
+/// date-formatting sites.
+pub fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
     let z = days_since_epoch + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = (z - era * 146097) as u64;
@@ -360,8 +359,6 @@ fn now_secs() -> u64 {
 // Sync orchestrator (spec 22)
 // =========================================================================
 
-use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;

@@ -5,7 +5,7 @@
 //! tree), persisted to `AppConfig`, and reflected back into the path entry.
 
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
 
 use gtk::glib;

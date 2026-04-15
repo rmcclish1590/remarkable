@@ -8,11 +8,10 @@
 //! page counter based on viewport centre.
 
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
 
 use anyhow::{Context, Result};
-use gtk::glib;
 use gtk::prelude::*;
 
 use crate::remarkable::metadata::RemarkableContent;
@@ -26,15 +25,14 @@ const INTER_PAGE_SPACING: i32 = 16;
 #[derive(Debug)]
 struct LoadedDocument {
     uuid: String,
-    cache_paths: Vec<PathBuf>,
     page_widgets: Vec<gtk::Box>,
 }
 
+#[derive(Clone)]
 pub struct DocumentViewer {
     pub widget: gtk::Box,
     scroll: gtk::ScrolledWindow,
     pages_box: gtk::Box,
-    placeholder: gtk::Label,
     stack: gtk::Stack,
     page_info_label: gtk::Label,
     current_doc: Rc<RefCell<Option<LoadedDocument>>>,
@@ -111,7 +109,6 @@ impl DocumentViewer {
             widget,
             scroll,
             pages_box,
-            placeholder,
             stack,
             page_info_label,
             current_doc,
@@ -130,7 +127,6 @@ impl DocumentViewer {
             .with_context(|| format!("reading {}", content_path.display()))?;
         let page_ids = content.pages.unwrap_or_default();
 
-        let mut cache_paths = Vec::new();
         let mut page_widgets = Vec::new();
         for (i, page_id) in page_ids.iter().enumerate() {
             let rm_path = raw.join(uuid).join(format!("{page_id}.rm"));
@@ -149,7 +145,6 @@ impl DocumentViewer {
             let page_widget = build_page_widget(&cache_path, i + 1);
             self.pages_box.append(&page_widget);
             page_widgets.push(page_widget);
-            cache_paths.push(cache_path);
         }
 
         if page_widgets.is_empty() {
@@ -162,7 +157,6 @@ impl DocumentViewer {
         self.stack.set_visible_child_name("pages");
         *self.current_doc.borrow_mut() = Some(LoadedDocument {
             uuid: uuid.to_string(),
-            cache_paths,
             page_widgets,
         });
         Ok(())
@@ -286,12 +280,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn aspect_ratio_is_reMarkable_native() {
+    fn aspect_ratio_is_remarkable_native() {
         assert_eq!(REMARKABLE_PAGE_ASPECT, (1404, 1872));
     }
 
     #[test]
-    fn inter_page_spacing_is_positive() {
-        assert!(INTER_PAGE_SPACING > 0);
+    fn inter_page_spacing_matches_constant() {
+        assert_eq!(INTER_PAGE_SPACING, 16);
     }
 }

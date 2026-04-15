@@ -13,7 +13,6 @@ use std::rc::Rc;
 use gtk::glib;
 use gtk::prelude::*;
 use libadwaita as adw;
-use libadwaita::prelude::*;
 
 use std::sync::OnceLock;
 
@@ -42,7 +41,6 @@ pub const APP_ID: &str = "com.rmsync.app";
 
 pub struct RmSyncApp {
     app: adw::Application,
-    config: Rc<RefCell<AppConfig>>,
 }
 
 impl RmSyncApp {
@@ -94,7 +92,7 @@ impl RmSyncApp {
             });
             main.window.present();
         });
-        Self { app, config }
+        Self { app }
     }
 
     pub fn run(&self) -> i32 {
@@ -122,7 +120,10 @@ fn wire_folder_browser_to_viewer(
     viewer: &DocumentViewer,
     config: Rc<RefCell<AppConfig>>,
 ) {
-    let viewer = viewer_clone(viewer);
+    // DocumentViewer is Clone — its fields are GTK widget refs (cheap
+    // GObject increments) and an Rc<RefCell<_>>. The closure runs on the
+    // GTK main thread so `!Send` is not a concern.
+    let viewer = viewer.clone();
     browser.connect_document_selected(move |uuid| {
         let sync_dir = config.borrow().sync.sync_dir.clone();
         if let Err(e) = viewer.load_document(&uuid, &sync_dir) {
@@ -131,43 +132,16 @@ fn wire_folder_browser_to_viewer(
     });
 }
 
-fn viewer_clone(v: &DocumentViewer) -> ViewerRef {
-    ViewerRef {
-        widget: v.widget.clone(),
-    }
-}
-
-struct ViewerRef {
-    widget: gtk::Box,
-}
-
-impl ViewerRef {
-    fn load_document(&self, _uuid: &str, _sync_dir: &std::path::Path) -> anyhow::Result<()> {
-        // Real loading is wired in spec 22 via DocumentViewer directly; we
-        // keep this ref here so the closure is 'static without borrowing the
-        // DocumentViewer (which contains non-Send widgets).
-        let _ = &self.widget;
-        Ok(())
-    }
-}
-
 pub(crate) fn wire_sync_button(
     sync_controls: &SyncControls,
-    folder_browser: &FolderBrowser,
+    _folder_browser: &FolderBrowser,
     _viewer: &DocumentViewer,
     last_sync_label: gtk::Label,
     config: Rc<RefCell<AppConfig>>,
 ) {
     let controls = sync_controls.clone();
     let controls_clone = sync_controls.clone();
-    let folder_browser_widget = folder_browser.widget.clone();
-    let folder_browser_for_reload = folder_browser as *const FolderBrowser;
-    // Store a non-null-aware reference into the closure; FolderBrowser lives
-    // as long as the window, so pointer is safe for the closure duration.
-    // Instead, clone the internal store so we can reload without the ptr:
     let browser_reload_cfg = config.clone();
-    let _ = folder_browser_widget; // silence unused
-    let _ = folder_browser_for_reload; // silence unused
     sync_controls.connect_sync_clicked(move || {
         let cfg = config.borrow().clone();
         let (tx, rx) = async_channel::unbounded::<SyncProgressEvent>();

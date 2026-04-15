@@ -147,6 +147,16 @@ impl MainWindow {
     }
 }
 
+fn format_unix_time(ts: u64) -> String {
+    // Reuse engine's civil_from_days to avoid a chrono dependency.
+    let days = (ts / 86400) as i64;
+    let (y, m, d) = crate::sync::engine::civil_from_days(days);
+    let secs_of_day = ts % 86400;
+    let h = secs_of_day / 3600;
+    let mi = (secs_of_day % 3600) / 60;
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,14 +172,4 @@ mod tests {
     fn format_unix_time_epoch() {
         assert_eq!(format_unix_time(0), "1970-01-01 00:00");
     }
-}
-
-fn format_unix_time(ts: u64) -> String {
-    // Reuse engine's civil_from_days to avoid a chrono dependency.
-    let days = (ts / 86400) as i64;
-    let (y, m, d) = crate::sync::engine::civil_from_days_public(days);
-    let secs_of_day = ts % 86400;
-    let h = secs_of_day / 3600;
-    let mi = (secs_of_day % 3600) / 60;
-    format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}")
 }

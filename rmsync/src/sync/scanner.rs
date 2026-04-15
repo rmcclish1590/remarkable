@@ -296,12 +296,9 @@ pub fn scan_local(sync_dir: &Path) -> Result<LocalManifest> {
     let mut documents = Vec::new();
     let mut total_size = 0u64;
     for uuid in &uuids {
-        match build_local_snapshot(&raw, uuid)? {
-            Some(snap) => {
-                total_size += snap.total_size_bytes;
-                documents.push(snap);
-            }
-            None => {}
+        if let Some(snap) = build_local_snapshot(&raw, uuid)? {
+            total_size += snap.total_size_bytes;
+            documents.push(snap);
         }
     }
 

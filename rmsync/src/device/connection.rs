@@ -446,7 +446,8 @@ async fn write_private_key(path: &Path, pem: &str) -> Result<(), std::io::Error>
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
+        // tokio::fs::OpenOptions provides `mode()` directly on unix; no
+        // extension-trait import required.
         opts.mode(0o600);
     }
     let mut f = opts.open(path).await?;

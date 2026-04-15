@@ -129,16 +129,6 @@ async fn list_remote_files_for_uuid(
     Ok(files)
 }
 
-fn local_path_for(raw: &Path, uuid: &str, remote_path: &str) -> PathBuf {
-    let subdir_prefix = format!("{XOCHITL_PATH}/{uuid}/");
-    if let Some(rel) = remote_path.strip_prefix(&subdir_prefix) {
-        return raw.join(uuid).join(rel);
-    }
-    let top_prefix = format!("{XOCHITL_PATH}/");
-    let rel = remote_path.strip_prefix(&top_prefix).unwrap_or(remote_path);
-    raw.join(rel)
-}
-
 /// Validate a uuid-like identifier: hex digits and `-` only, length-bounded.
 /// Rejects anything that could escape a path component or pollute globs.
 fn is_safe_uuid(uuid: &str) -> bool {
@@ -802,20 +792,6 @@ mod tests {
         assert!(!is_safe_uuid("../evil"));
         assert!(!is_safe_uuid("abc/def"));
         assert!(!is_safe_uuid("abc.def"));
-    }
-
-    #[test]
-    fn local_path_maps_top_level_file() {
-        let raw = Path::new("/sync/raw");
-        let out = local_path_for(raw, "abc", &format!("{XOCHITL_PATH}/abc.metadata"));
-        assert_eq!(out, PathBuf::from("/sync/raw/abc.metadata"));
-    }
-
-    #[test]
-    fn local_path_maps_subdir_page() {
-        let raw = Path::new("/sync/raw");
-        let out = local_path_for(raw, "abc", &format!("{XOCHITL_PATH}/abc/p1.rm"));
-        assert_eq!(out, PathBuf::from("/sync/raw/abc/p1.rm"));
     }
 
     #[test]

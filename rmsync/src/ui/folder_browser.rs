@@ -81,13 +81,14 @@ fn classify_node(node: &DocumentNode) -> TreeItemType {
     }
 }
 
+type SelectedCallback = Rc<RefCell<Option<Box<dyn Fn(String)>>>>;
+
 pub struct FolderBrowser {
     pub widget: gtk::Box,
-    list_view: gtk::ListView,
     root_store: gio::ListStore,
     selection: gtk::SingleSelection,
     tree_model: gtk::TreeListModel,
-    selected_callback: Rc<RefCell<Option<Box<dyn Fn(String)>>>>,
+    selected_callback: SelectedCallback,
 }
 
 impl FolderBrowser {
@@ -197,8 +198,7 @@ impl FolderBrowser {
         widget.set_vexpand(true);
         widget.set_hexpand(true);
 
-        let selected_callback: Rc<RefCell<Option<Box<dyn Fn(String)>>>> =
-            Rc::new(RefCell::new(None));
+        let selected_callback: SelectedCallback = Rc::new(RefCell::new(None));
         let cb_for_signal = selected_callback.clone();
         let selection_for_signal = selection.clone();
         selection.connect_selection_changed(move |_, _, _| {
@@ -225,7 +225,6 @@ impl FolderBrowser {
 
         Self {
             widget,
-            list_view,
             root_store,
             selection,
             tree_model,
