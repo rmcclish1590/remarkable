@@ -9,6 +9,7 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::config::AppConfig;
+use crate::ui::device_status::DeviceStatusWidget;
 use crate::ui::folder_browser::FolderBrowser;
 
 const MIN_SIDEBAR_WIDTH: i32 = 200;
@@ -23,7 +24,7 @@ pub struct MainWindow {
     pub paned: gtk::Paned,
     pub sidebar_scroll: gtk::ScrolledWindow,
     pub viewer_scroll: gtk::ScrolledWindow,
-    pub device_status_label: gtk::Label,
+    pub device_status: DeviceStatusWidget,
     pub sync_button: gtk::Button,
     pub folder_browser: FolderBrowser,
 }
@@ -37,9 +38,7 @@ impl MainWindow {
             .default_height(config.ui.window_height)
             .build();
 
-        let device_status_label = gtk::Label::builder()
-            .label("● Disconnected")
-            .build();
+        let device_status = DeviceStatusWidget::new();
         let sync_button = gtk::Button::builder()
             .label("Sync")
             .sensitive(false)
@@ -47,7 +46,7 @@ impl MainWindow {
         let header_bar = adw::HeaderBar::builder()
             .title_widget(&gtk::Label::builder().label("rmSync").build())
             .build();
-        header_bar.pack_start(&device_status_label);
+        header_bar.pack_start(&device_status.widget);
         header_bar.pack_end(&sync_button);
 
         let toolbar = gtk::Box::builder()
@@ -123,7 +122,7 @@ impl MainWindow {
             paned,
             sidebar_scroll,
             viewer_scroll,
-            device_status_label,
+            device_status,
             sync_button,
             folder_browser,
         }
