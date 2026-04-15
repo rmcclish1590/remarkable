@@ -238,6 +238,198 @@ pub fn delete_local_document(uuid: &str, sync_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub struct PushResult {
+    pub uuid: String,
+    pub files_transferred: usize,
+    pub bytes_transferred: u64,
+    pub duration_ms: u64,
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+/// Upload every local file for `uuid` to the reMarkable. Uses `.tmp` upload
+/// + rename so partial uploads can't corrupt the device's view.
+pub async fn push_document(
+    conn: &DeviceConnection,
+    uuid: &str,
+    sync_dir: &Path,
+) -> Result<PushResult> {
+    let start = Instant::now();
+    let raw = sync_dir.join(RAW_SUBDIR);
+    let meta = raw.join(format!("{uuid}.metadata"));
+    if !meta.exists() {
+        return Ok(PushResult {
+            uuid: uuid.into(),
+            files_transferred: 0,
+            bytes_transferred: 0,
+            duration_ms: start.elapsed().as_millis() as u64,
+            success: false,
+            error: Some(format!("local metadata missing: {}", meta.display())),
+        });
+    }
+
+    let local_files = local_files_for_uuid(&raw, uuid)?;
+    let subdir_remote = format!("{XOCHITL_PATH}/{uuid}");
+    if local_files.iter().any(|(_, rel)| rel.starts_with(&format!("{uuid}/"))) {
+        let _ = conn.mkdir(&subdir_remote).await;
+    }
+
+    let mut transferred = 0usize;
+    let mut bytes = 0u64;
+    let mut first_err: Option<String> = None;
+    for (local_path, rel) in &local_files {
+        let remote_path = format!("{XOCHITL_PATH}/{rel}");
+        match upload_atomic(conn, local_path, &remote_path).await {
+            Ok(n) => {
+                transferred += 1;
+                bytes += n;
+            }
+            Err(e) => {
+                first_err.get_or_insert_with(|| format!("{}: {e}", remote_path));
+                let _ = conn.delete_file(&format!("{remote_path}.tmp")).await;
+            }
+        }
+    }
+
+    Ok(PushResult {
+        uuid: uuid.into(),
+        files_transferred: transferred,
+        bytes_transferred: bytes,
+        duration_ms: start.elapsed().as_millis() as u64,
+        success: first_err.is_none() && !local_files.is_empty(),
+        error: first_err,
+    })
+}
+
+async fn upload_atomic(
+    conn: &DeviceConnection,
+    local_path: &Path,
+    remote_path: &str,
+) -> Result<u64> {
+    let tmp_remote = format!("{remote_path}.tmp");
+    let data = tokio::fs::read(local_path).await?;
+    conn.write_file(&tmp_remote, &data).await?;
+    // russh-sftp has no atomic-rename helper on SftpSession; use its underlying
+    // raw client by calling rename via the session (available as sftp.rename).
+    conn.sftp()?
+        .rename(&tmp_remote, remote_path)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    Ok(data.len() as u64)
+}
+
+fn local_files_for_uuid(raw: &Path, uuid: &str) -> Result<Vec<(PathBuf, String)>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(raw)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if entry.file_type()?.is_file() && name.starts_with(&format!("{uuid}.")) {
+            out.push((entry.path(), name));
+        }
+    }
+    let subdir = raw.join(uuid);
+    if subdir.is_dir() {
+        for entry in std::fs::read_dir(&subdir)? {
+            let entry = entry?;
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            if entry.file_type()?.is_file() {
+                out.push((entry.path(), format!("{uuid}/{fname}")));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Execute every Push action in the plan, updating the DB after each.
+pub async fn push_batch<F>(
+    conn: &DeviceConnection,
+    plan: &SyncPlan,
+    sync_dir: &Path,
+    db: &StateDb,
+    progress_callback: F,
+) -> Result<Vec<PushResult>>
+where
+    F: Fn(TransferProgress) + Send + 'static,
+{
+    let pushes: Vec<&SyncAction> = plan
+        .actions
+        .iter()
+        .filter(|a| matches!(a.action_type, SyncActionType::Push))
+        .collect();
+    let files_total = pushes.len();
+    let mut bytes_done = 0u64;
+    let mut results = Vec::with_capacity(files_total);
+    for (i, action) in pushes.iter().enumerate() {
+        progress_callback(TransferProgress {
+            current_file: action.visible_name.clone(),
+            current_uuid: action.uuid.clone(),
+            files_done: i,
+            files_total,
+            bytes_done,
+            bytes_total: 0,
+        });
+        let result = push_document(conn, &action.uuid, sync_dir).await?;
+        if result.success {
+            if let Some(mut state) = db.get_state(&result.uuid)? {
+                state.remote_hash = state.local_hash.clone();
+                state.synced_hash = state.local_hash.clone();
+                state.synced_mtime = state.local_mtime;
+                state.sync_status = crate::sync::state_db::SyncStatus::Synced;
+                state.last_sync_at = Some(now_secs());
+                db.upsert_state(&state)?;
+            }
+        } else if let Some(mut state) = db.get_state(&result.uuid)? {
+            state.sync_status = crate::sync::state_db::SyncStatus::Error;
+            db.upsert_state(&state)?;
+        }
+        bytes_done += result.bytes_transferred;
+        results.push(result);
+    }
+    progress_callback(TransferProgress {
+        current_file: String::new(),
+        current_uuid: String::new(),
+        files_done: files_total,
+        files_total,
+        bytes_done,
+        bytes_total: 0,
+    });
+    Ok(results)
+}
+
+/// Delete every remote file for `uuid` on the reMarkable.
+pub async fn delete_remote_document(conn: &DeviceConnection, uuid: &str) -> Result<()> {
+    let entries = conn.list_dir(XOCHITL_PATH).await?;
+    let subdir = format!("{XOCHITL_PATH}/{uuid}");
+    if let Ok(children) = conn.list_dir(&subdir).await {
+        for child in children {
+            let _ = conn.delete_file(&child.path).await;
+        }
+        let _ = conn
+            .sftp()?
+            .remove_dir(&subdir)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()));
+    }
+    for e in entries {
+        if e.name.starts_with(&format!("{uuid}.")) {
+            let _ = conn.delete_file(&e.path).await;
+        }
+    }
+    Ok(())
+}
+
+/// Ask the reMarkable to reload its document list after a batch of
+/// mutations. Restarting xochitl causes a brief screen refresh — invoke this
+/// once at the end of a sync, not per-file.
+pub async fn reload_xochitl(conn: &mut DeviceConnection) -> Result<()> {
+    let status = conn.exec("systemctl restart xochitl").await?;
+    if status != 0 {
+        tracing::warn!("systemctl restart xochitl exited with {status}");
+    }
+    Ok(())
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -319,6 +511,39 @@ mod tests {
         };
         assert_eq!(p.files_total, 3);
         assert_eq!(p.bytes_done, 100);
+    }
+
+    #[test]
+    fn local_files_for_uuid_collects_siblings_and_pages() {
+        let dir = tempdir().unwrap();
+        let raw = dir.path();
+        std::fs::write(raw.join("abc.metadata"), b"m").unwrap();
+        std::fs::write(raw.join("abc.content"), b"c").unwrap();
+        std::fs::write(raw.join("other.metadata"), b"o").unwrap();
+        std::fs::create_dir_all(raw.join("abc")).unwrap();
+        std::fs::write(raw.join("abc/p1.rm"), b"1").unwrap();
+        std::fs::write(raw.join("abc/p2.rm"), b"2").unwrap();
+
+        let files = local_files_for_uuid(raw, "abc").unwrap();
+        let rels: Vec<&String> = files.iter().map(|(_, r)| r).collect();
+        assert!(rels.contains(&&"abc.metadata".to_string()));
+        assert!(rels.contains(&&"abc.content".to_string()));
+        assert!(rels.iter().any(|r| r.ends_with("abc/p1.rm")));
+        assert!(rels.iter().any(|r| r.ends_with("abc/p2.rm")));
+        assert!(!rels.contains(&&"other.metadata".to_string()));
+    }
+
+    #[test]
+    fn push_result_construction() {
+        let r = PushResult {
+            uuid: "a".into(),
+            files_transferred: 1,
+            bytes_transferred: 10,
+            duration_ms: 5,
+            success: true,
+            error: None,
+        };
+        assert!(r.success);
     }
 
     #[tokio::test]

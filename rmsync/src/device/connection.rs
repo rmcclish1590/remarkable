@@ -298,6 +298,30 @@ impl DeviceConnection {
             .map_err(|e| ConnectionError::SftpError(e.to_string()))
     }
 
+    /// Execute a command on the device and wait for its exit status. Returns
+    /// the exit code on completion, or an error if the channel/SSH layer
+    /// faults. Stdout/stderr are discarded.
+    pub async fn exec(&mut self, command: &str) -> Result<u32, ConnectionError> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or(ConnectionError::NotConnected)?;
+        let mut channel = session
+            .channel_open_session()
+            .await
+            .map_err(|e| ConnectionError::SshError(e.to_string()))?;
+        channel
+            .exec(true, command)
+            .await
+            .map_err(|e| ConnectionError::SshError(e.to_string()))?;
+        while let Some(msg) = channel.wait().await {
+            if let ChannelMsg::ExitStatus { exit_status } = msg {
+                return Ok(exit_status);
+            }
+        }
+        Err(ConnectionError::SshError("channel closed without exit status".into()))
+    }
+
     /// Generate an Ed25519 keypair, install the public key in the device's
     /// `~/.ssh/authorized_keys`, and switch this connection's config to key
     /// authentication. Returns the private-key path on success.
