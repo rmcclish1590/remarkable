@@ -235,6 +235,123 @@ fn derive_name_and_priority(
     (String::new(), 1)
 }
 
+// =========================================================================
+// Conflict resolution (spec 14)
+// =========================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictWinner {
+    Local,
+    Remote,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConflictResolution {
+    pub uuid: String,
+    pub visible_name: String,
+    pub winner: ConflictWinner,
+    pub backup_uuid: String,
+    pub backup_name: String,
+    pub local_mtime: u64,
+    pub remote_mtime: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConflictNotification {
+    pub document_name: String,
+    pub winner_source: String,
+    pub winner_mtime: u64,
+    pub loser_mtime: u64,
+    pub backup_name: String,
+    pub time_difference_human: String,
+}
+
+impl ConflictResolution {
+    pub fn to_notification(&self) -> ConflictNotification {
+        let (winner_source, winner_mtime, loser_mtime) = match self.winner {
+            ConflictWinner::Local => ("local", self.local_mtime, self.remote_mtime),
+            ConflictWinner::Remote => ("reMarkable", self.remote_mtime, self.local_mtime),
+        };
+        ConflictNotification {
+            document_name: self.visible_name.clone(),
+            winner_source: winner_source.to_string(),
+            winner_mtime,
+            loser_mtime,
+            backup_name: self.backup_name.clone(),
+            time_difference_human: humanise_delta(winner_mtime, loser_mtime, winner_source),
+        }
+    }
+}
+
+fn humanise_delta(winner: u64, loser: u64, winner_source: &str) -> String {
+    let delta = winner.saturating_sub(loser);
+    let (value, unit) = if delta >= 86400 {
+        (delta / 86400, "day")
+    } else if delta >= 3600 {
+        (delta / 3600, "hour")
+    } else if delta >= 60 {
+        (delta / 60, "minute")
+    } else {
+        (delta, "second")
+    };
+    let plural = if value == 1 { "" } else { "s" };
+    format!("{winner_source} was {value} {unit}{plural} newer")
+}
+
+/// Resolve a conflict action using last-write-wins (ties favour the device).
+pub fn resolve_conflict(
+    action: &SyncAction,
+    local: &LocalDocumentSnapshot,
+    remote: &RemoteDocumentSnapshot,
+) -> ConflictResolution {
+    let winner = if local.mtime > remote.mtime {
+        ConflictWinner::Local
+    } else {
+        ConflictWinner::Remote
+    };
+    let date = conflict_date_string(now_secs());
+    let backup_name = format!("{} (conflict {date})", local.metadata.visible_name);
+    ConflictResolution {
+        uuid: action.uuid.clone(),
+        visible_name: local.metadata.visible_name.clone(),
+        winner,
+        backup_uuid: uuid::Uuid::new_v4().to_string(),
+        backup_name,
+        local_mtime: local.mtime,
+        remote_mtime: remote.mtime,
+    }
+}
+
+fn conflict_date_string(unix: u64) -> String {
+    // Minimal YYYY-MM-DD formatter, no chrono dependency: convert unix seconds
+    // to a civil date using the algorithm from Howard Hinnant.
+    let days = (unix / 86400) as i64;
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
+    let z = days_since_epoch + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m as u32, d as u32)
+}
+
+fn now_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn action_rank(a: &SyncActionType) -> u8 {
     match a {
         SyncActionType::Pull => 0,
@@ -514,6 +631,87 @@ mod tests {
         let p = plan_with(vec![], vec![], vec![]);
         assert_eq!(p.actions.len(), 0);
         assert!(p.is_empty());
+    }
+
+    // --- conflict resolution (spec 14) ---
+
+    fn action_conflict(uuid: &str, lm: u64, rm: u64) -> SyncAction {
+        SyncAction {
+            uuid: uuid.into(),
+            visible_name: uuid.into(),
+            action_type: SyncActionType::Conflict {
+                local_mtime: lm,
+                remote_mtime: rm,
+            },
+            priority: 1,
+        }
+    }
+
+    fn local_with_mtime(uuid: &str, hash: &str, mtime: u64) -> LocalDocumentSnapshot {
+        let mut d = local(uuid, hash, "DocumentType");
+        d.mtime = mtime;
+        d
+    }
+    fn remote_with_mtime(uuid: &str, hash: &str, mtime: u64) -> RemoteDocumentSnapshot {
+        let mut d = remote(uuid, hash, "DocumentType");
+        d.mtime = mtime;
+        d
+    }
+
+    #[test]
+    fn conflict_remote_wins_when_newer() {
+        let a = action_conflict("a", 100, 200);
+        let l = local_with_mtime("a", "hL", 100);
+        let r = remote_with_mtime("a", "hR", 200);
+        let res = resolve_conflict(&a, &l, &r);
+        assert_eq!(res.winner, ConflictWinner::Remote);
+    }
+
+    #[test]
+    fn conflict_local_wins_when_newer() {
+        let a = action_conflict("a", 300, 200);
+        let l = local_with_mtime("a", "hL", 300);
+        let r = remote_with_mtime("a", "hR", 200);
+        let res = resolve_conflict(&a, &l, &r);
+        assert_eq!(res.winner, ConflictWinner::Local);
+    }
+
+    #[test]
+    fn conflict_equal_mtime_favours_remote() {
+        let a = action_conflict("a", 100, 100);
+        let l = local_with_mtime("a", "hL", 100);
+        let r = remote_with_mtime("a", "hR", 100);
+        let res = resolve_conflict(&a, &l, &r);
+        assert_eq!(res.winner, ConflictWinner::Remote);
+    }
+
+    #[test]
+    fn conflict_generates_backup_name_and_uuid() {
+        let a = action_conflict("a", 1, 2);
+        let l = local_with_mtime("a", "hL", 1);
+        let r = remote_with_mtime("a", "hR", 2);
+        let res = resolve_conflict(&a, &l, &r);
+        assert!(res.backup_name.starts_with("a (conflict "));
+        assert_eq!(res.backup_uuid.len(), 36); // UUID v4 string length
+        assert_ne!(res.backup_uuid, "a");
+    }
+
+    #[test]
+    fn conflict_notification_has_human_delta() {
+        let a = action_conflict("a", 100, 100 + 7200);
+        let l = local_with_mtime("a", "hL", 100);
+        let r = remote_with_mtime("a", "hR", 100 + 7200);
+        let res = resolve_conflict(&a, &l, &r);
+        let n = res.to_notification();
+        assert_eq!(n.winner_source, "reMarkable");
+        assert!(n.time_difference_human.contains("hour"));
+    }
+
+    #[test]
+    fn civil_from_days_matches_known_dates() {
+        // 2025-01-01 is day 20089 since 1970-01-01 (Gregorian).
+        assert_eq!(civil_from_days(20089), (2025, 1, 1));
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
     }
 
     #[test]

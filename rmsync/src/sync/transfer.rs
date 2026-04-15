@@ -10,9 +10,15 @@ use anyhow::{Context, Result};
 use filetime::{set_file_mtime, FileTime};
 
 use crate::device::connection::{DeviceConnection, RemoteFileInfo};
-use crate::sync::engine::{SyncAction, SyncActionType, SyncPlan};
-use crate::sync::scanner::{RAW_SUBDIR, XOCHITL_PATH};
-use crate::sync::state_db::StateDb;
+use crate::sync::engine::{
+    ConflictResolution, ConflictWinner, SyncAction, SyncActionType, SyncPlan,
+};
+use crate::sync::scanner::{
+    LocalDocumentSnapshot, LocalManifest, RemoteDocumentSnapshot, RemoteManifest, RAW_SUBDIR,
+    XOCHITL_PATH,
+};
+use crate::sync::state_db::{StateDb, SyncFileState, SyncStatus};
+use crate::remarkable::metadata::RemarkableMetadata;
 
 #[derive(Debug, Clone)]
 pub struct PullResult {
@@ -435,6 +441,204 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+// =========================================================================
+// Conflict resolution execution (spec 14)
+// =========================================================================
+
+/// Execute a resolved conflict. On Remote-wins we preserve the local copy
+/// under a new backup UUID then pull the remote. On Local-wins we pull the
+/// remote under the backup UUID, keep local files in place, and push the
+/// original UUID back to the device.
+pub async fn execute_conflict_resolution(
+    conn: &DeviceConnection,
+    resolution: &ConflictResolution,
+    local: &LocalDocumentSnapshot,
+    remote: &RemoteDocumentSnapshot,
+    sync_dir: &Path,
+    db: &StateDb,
+) -> Result<()> {
+    let raw = sync_dir.join(RAW_SUBDIR);
+    tokio::fs::create_dir_all(&raw).await?;
+    match resolution.winner {
+        ConflictWinner::Remote => {
+            copy_local_as_backup(&raw, &resolution.uuid, &resolution.backup_uuid, &resolution.backup_name)?;
+            let _ = pull_document(conn, &resolution.uuid, sync_dir).await?;
+            record_winner_state(db, &resolution.uuid, local, remote, ConflictWinner::Remote)?;
+            record_backup_state(db, &resolution.backup_uuid, &resolution.backup_name, local)?;
+        }
+        ConflictWinner::Local => {
+            pull_document_to_backup(conn, &resolution.uuid, &resolution.backup_uuid, &resolution.backup_name, sync_dir).await?;
+            let _ = push_document(conn, &resolution.uuid, sync_dir).await?;
+            record_winner_state(db, &resolution.uuid, local, remote, ConflictWinner::Local)?;
+            record_backup_state(db, &resolution.backup_uuid, &resolution.backup_name, local)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_local_as_backup(
+    raw: &Path,
+    uuid: &str,
+    backup_uuid: &str,
+    backup_name: &str,
+) -> Result<()> {
+    for entry in std::fs::read_dir(raw)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(suffix) = name.strip_prefix(&format!("{uuid}.")) {
+            let dest = raw.join(format!("{backup_uuid}.{suffix}"));
+            if suffix == "metadata" {
+                let mut md: RemarkableMetadata = serde_json::from_slice(&std::fs::read(entry.path())?)?;
+                md.visible_name = backup_name.to_string();
+                std::fs::write(&dest, serde_json::to_vec_pretty(&md)?)?;
+            } else {
+                std::fs::copy(entry.path(), &dest)?;
+            }
+        }
+    }
+    let subdir = raw.join(uuid);
+    if subdir.is_dir() {
+        let dest_dir = raw.join(backup_uuid);
+        std::fs::create_dir_all(&dest_dir)?;
+        for entry in std::fs::read_dir(&subdir)? {
+            let entry = entry?;
+            std::fs::copy(entry.path(), dest_dir.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
+async fn pull_document_to_backup(
+    conn: &DeviceConnection,
+    uuid: &str,
+    backup_uuid: &str,
+    backup_name: &str,
+    sync_dir: &Path,
+) -> Result<()> {
+    let raw = sync_dir.join(RAW_SUBDIR);
+    tokio::fs::create_dir_all(&raw).await?;
+    let remote_files = list_remote_files_for_uuid(conn, uuid).await?;
+    for f in &remote_files {
+        let subdir_prefix = format!("{XOCHITL_PATH}/{uuid}/");
+        let local_path = if let Some(rel) = f.path.strip_prefix(&subdir_prefix) {
+            raw.join(backup_uuid).join(rel)
+        } else {
+            let top_prefix = format!("{XOCHITL_PATH}/");
+            let name = f.path.strip_prefix(&top_prefix).unwrap_or(&f.path);
+            let remapped = name.replacen(uuid, backup_uuid, 1);
+            raw.join(remapped)
+        };
+        if let Some(parent) = local_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let bytes = conn.read_file(&f.path).await?;
+        let tmp = tmp_path(&local_path);
+        tokio::fs::write(&tmp, &bytes).await?;
+        tokio::fs::rename(&tmp, &local_path).await?;
+    }
+    let backup_meta = raw.join(format!("{backup_uuid}.metadata"));
+    if backup_meta.exists() {
+        let bytes = std::fs::read(&backup_meta)?;
+        if let Ok(mut md) = serde_json::from_slice::<RemarkableMetadata>(&bytes) {
+            md.visible_name = backup_name.to_string();
+            std::fs::write(&backup_meta, serde_json::to_vec_pretty(&md)?)?;
+        }
+    }
+    Ok(())
+}
+
+fn record_winner_state(
+    db: &StateDb,
+    uuid: &str,
+    local: &LocalDocumentSnapshot,
+    remote: &RemoteDocumentSnapshot,
+    winner: ConflictWinner,
+) -> Result<()> {
+    let winning_hash = match winner {
+        ConflictWinner::Local => local.content_hash.clone(),
+        ConflictWinner::Remote => remote.content_hash.clone(),
+    };
+    let winning_mtime = match winner {
+        ConflictWinner::Local => local.mtime,
+        ConflictWinner::Remote => remote.mtime,
+    };
+    let state = SyncFileState {
+        uuid: uuid.to_string(),
+        visible_name: local.metadata.visible_name.clone(),
+        parent_uuid: local.metadata.parent.clone(),
+        doc_type: local.metadata.doc_type.clone(),
+        local_hash: Some(winning_hash.clone()),
+        remote_hash: Some(winning_hash.clone()),
+        synced_hash: Some(winning_hash),
+        local_mtime: Some(winning_mtime),
+        remote_mtime: Some(winning_mtime),
+        synced_mtime: Some(winning_mtime),
+        last_sync_at: Some(now_secs()),
+        sync_status: SyncStatus::Synced,
+        conflict_info: None,
+    };
+    db.upsert_state(&state)?;
+    Ok(())
+}
+
+fn record_backup_state(
+    db: &StateDb,
+    backup_uuid: &str,
+    backup_name: &str,
+    local: &LocalDocumentSnapshot,
+) -> Result<()> {
+    let state = SyncFileState {
+        uuid: backup_uuid.to_string(),
+        visible_name: backup_name.to_string(),
+        parent_uuid: local.metadata.parent.clone(),
+        doc_type: local.metadata.doc_type.clone(),
+        local_hash: Some(local.content_hash.clone()),
+        remote_hash: None,
+        synced_hash: None,
+        local_mtime: Some(local.mtime),
+        remote_mtime: None,
+        synced_mtime: None,
+        last_sync_at: None,
+        sync_status: SyncStatus::Pending,
+        conflict_info: None,
+    };
+    db.upsert_state(&state)?;
+    Ok(())
+}
+
+/// Resolve every Conflict action in a plan using last-write-wins.
+pub async fn resolve_all_conflicts(
+    conn: &DeviceConnection,
+    plan: &SyncPlan,
+    local_manifest: &LocalManifest,
+    remote_manifest: &RemoteManifest,
+    sync_dir: &Path,
+    db: &StateDb,
+) -> Result<Vec<ConflictResolution>> {
+    let mut out = Vec::new();
+    let local_map: std::collections::HashMap<&str, &LocalDocumentSnapshot> = local_manifest
+        .documents
+        .iter()
+        .map(|d| (d.uuid.as_str(), d))
+        .collect();
+    let remote_map: std::collections::HashMap<&str, &RemoteDocumentSnapshot> = remote_manifest
+        .documents
+        .iter()
+        .map(|d| (d.uuid.as_str(), d))
+        .collect();
+    for action in plan.conflicts() {
+        if let (Some(l), Some(r)) = (
+            local_map.get(action.uuid.as_str()),
+            remote_map.get(action.uuid.as_str()),
+        ) {
+            let resolution = crate::sync::engine::resolve_conflict(action, l, r);
+            execute_conflict_resolution(conn, &resolution, l, r, sync_dir, db).await?;
+            out.push(resolution);
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
