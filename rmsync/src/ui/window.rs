@@ -11,6 +11,7 @@ use libadwaita::prelude::*;
 use crate::config::AppConfig;
 use crate::ui::device_status::DeviceStatusWidget;
 use crate::ui::folder_browser::FolderBrowser;
+use crate::ui::sync_controls::SyncControls;
 
 const MIN_SIDEBAR_WIDTH: i32 = 200;
 const MIN_VIEWER_WIDTH: i32 = 400;
@@ -25,7 +26,7 @@ pub struct MainWindow {
     pub sidebar_scroll: gtk::ScrolledWindow,
     pub viewer_scroll: gtk::ScrolledWindow,
     pub device_status: DeviceStatusWidget,
-    pub sync_button: gtk::Button,
+    pub sync_controls: SyncControls,
     pub folder_browser: FolderBrowser,
 }
 
@@ -39,15 +40,12 @@ impl MainWindow {
             .build();
 
         let device_status = DeviceStatusWidget::new();
-        let sync_button = gtk::Button::builder()
-            .label("Sync")
-            .sensitive(false)
-            .build();
+        let sync_controls = SyncControls::new();
         let header_bar = adw::HeaderBar::builder()
             .title_widget(&gtk::Label::builder().label("rmSync").build())
             .build();
         header_bar.pack_start(&device_status.widget);
-        header_bar.pack_end(&sync_button);
+        header_bar.pack_end(&sync_controls.sync_button);
 
         let toolbar = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -110,6 +108,7 @@ impl MainWindow {
         root.append(&header_bar);
         root.append(&toolbar);
         root.append(&paned);
+        root.append(&sync_controls.progress_box);
         paned.set_vexpand(true);
         window.set_content(Some(&root));
 
@@ -123,7 +122,7 @@ impl MainWindow {
             sidebar_scroll,
             viewer_scroll,
             device_status,
-            sync_button,
+            sync_controls,
             folder_browser,
         }
     }
