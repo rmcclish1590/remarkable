@@ -9,6 +9,7 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::config::AppConfig;
+use crate::ui::folder_browser::FolderBrowser;
 
 const MIN_SIDEBAR_WIDTH: i32 = 200;
 const MIN_VIEWER_WIDTH: i32 = 400;
@@ -24,6 +25,7 @@ pub struct MainWindow {
     pub viewer_scroll: gtk::ScrolledWindow,
     pub device_status_label: gtk::Label,
     pub sync_button: gtk::Button,
+    pub folder_browser: FolderBrowser,
 }
 
 impl MainWindow {
@@ -71,16 +73,12 @@ impl MainWindow {
         toolbar.append(&sep);
         toolbar.append(&last_sync_label);
 
-        let sidebar_placeholder = gtk::Label::builder()
-            .label("No documents")
-            .halign(gtk::Align::Center)
-            .valign(gtk::Align::Center)
-            .build();
+        let folder_browser = FolderBrowser::new();
         let sidebar_scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vscrollbar_policy(gtk::PolicyType::Automatic)
             .width_request(MIN_SIDEBAR_WIDTH)
-            .child(&sidebar_placeholder)
+            .child(&folder_browser.widget)
             .build();
         sidebar_scroll.add_css_class("sidebar");
 
@@ -127,6 +125,7 @@ impl MainWindow {
             viewer_scroll,
             device_status_label,
             sync_button,
+            folder_browser,
         }
     }
 
