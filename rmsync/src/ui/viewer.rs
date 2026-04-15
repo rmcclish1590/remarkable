@@ -1,53 +1,62 @@
-//! Document viewer panel — renders rendered SVG pages for the selected notebook.
+//! Document viewer panel — continuous multi-page scroll (spec 21).
 //!
-//! Spec 20 — single-page mode. `DocumentViewer::load_document` parses
-//! `.content` + each referenced `.rm` page, renders to SVG (cached under
-//! `{sync_dir}/.rmsync/cache/`), and displays one page at a time inside a
-//! `GtkPicture` with `ContentFit::Contain`. Prev/Next buttons + keyboard
-//! arrows navigate.
+//! Each page of the currently loaded notebook gets its own `GtkPicture`
+//! showing the cached SVG under `{sync_dir}/.rmsync/cache/`. Pictures are
+//! stacked vertically inside a `ScrolledWindow`; `GtkPicture::set_filename`
+//! defers decoding until the picture becomes visible, giving effectively
+//! lazy rendering without bespoke machinery. A scroll listener updates the
+//! page counter based on viewport centre.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use anyhow::{Context, Result};
-use gtk::gdk;
 use gtk::glib;
 use gtk::prelude::*;
 
 use crate::remarkable::metadata::RemarkableContent;
-use crate::remarkable::rm_parser::{parse_rm_file, RmPage};
+use crate::remarkable::rm_parser::parse_rm_file;
 use crate::remarkable::svg_renderer::render_page_to_svg;
 
 const REMARKABLE_PAGE_WIDTH: i32 = 1404;
 const REMARKABLE_PAGE_HEIGHT: i32 = 1872;
+const INTER_PAGE_SPACING: i32 = 16;
 
 #[derive(Debug)]
 struct LoadedDocument {
     uuid: String,
-    name: String,
-    pages: Vec<RmPage>,
     cache_paths: Vec<PathBuf>,
-    current_page: usize,
+    page_widgets: Vec<gtk::Box>,
 }
 
 pub struct DocumentViewer {
     pub widget: gtk::Box,
-    picture: gtk::Picture,
+    scroll: gtk::ScrolledWindow,
+    pages_box: gtk::Box,
     placeholder: gtk::Label,
+    stack: gtk::Stack,
     page_info_label: gtk::Label,
-    prev_button: gtk::Button,
-    next_button: gtk::Button,
     current_doc: Rc<RefCell<Option<LoadedDocument>>>,
 }
 
 impl DocumentViewer {
     pub fn new() -> Self {
-        let picture = gtk::Picture::new();
-        picture.set_content_fit(gtk::ContentFit::Contain);
-        picture.set_can_shrink(true);
-        picture.set_vexpand(true);
-        picture.set_hexpand(true);
+        let pages_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(INTER_PAGE_SPACING)
+            .margin_top(8)
+            .margin_bottom(8)
+            .margin_start(16)
+            .margin_end(16)
+            .build();
+        let scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Automatic)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .child(&pages_box)
+            .build();
+        scroll.set_vexpand(true);
+        scroll.set_hexpand(true);
 
         let placeholder = gtk::Label::builder()
             .label("Select a document from the sidebar to view it")
@@ -62,113 +71,56 @@ impl DocumentViewer {
             .transition_type(gtk::StackTransitionType::Crossfade)
             .build();
         stack.add_named(&placeholder, Some("placeholder"));
-        stack.add_named(&picture, Some("picture"));
+        stack.add_named(&scroll, Some("pages"));
         stack.set_visible_child_name("placeholder");
         stack.set_vexpand(true);
         stack.set_hexpand(true);
 
-        let page_info_label = gtk::Label::new(Some(""));
-        let prev_button = gtk::Button::builder()
-            .label("◀ Prev")
-            .sensitive(false)
-            .build();
-        let next_button = gtk::Button::builder()
-            .label("Next ▶")
-            .sensitive(false)
-            .build();
-        let nav_box = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(8)
-            .margin_top(4)
-            .margin_bottom(8)
+        let page_info_label = gtk::Label::builder()
+            .label("")
             .halign(gtk::Align::Center)
+            .margin_top(2)
+            .margin_bottom(6)
             .build();
-        nav_box.append(&prev_button);
-        nav_box.append(&page_info_label);
-        nav_box.append(&next_button);
+        page_info_label.add_css_class("dim-label");
 
         let widget = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .build();
         widget.append(&stack);
-        widget.append(&nav_box);
+        widget.append(&page_info_label);
 
         let current_doc: Rc<RefCell<Option<LoadedDocument>>> = Rc::new(RefCell::new(None));
 
-        // Navigation wiring
-        {
-            let current_doc_for_prev = current_doc.clone();
-            let picture_for_prev = picture.clone();
-            let info_for_prev = page_info_label.clone();
-            let prev_btn_clone = prev_button.clone();
-            let next_btn_clone = next_button.clone();
-            prev_button.connect_clicked(move |_| {
-                navigate(
-                    &current_doc_for_prev,
-                    &picture_for_prev,
-                    &info_for_prev,
-                    &prev_btn_clone,
-                    &next_btn_clone,
-                    -1,
-                );
-            });
-        }
-        {
-            let current_doc_for_next = current_doc.clone();
-            let picture_for_next = picture.clone();
-            let info_for_next = page_info_label.clone();
-            let prev_btn_clone = prev_button.clone();
-            let next_btn_clone = next_button.clone();
-            next_button.connect_clicked(move |_| {
-                navigate(
-                    &current_doc_for_next,
-                    &picture_for_next,
-                    &info_for_next,
-                    &prev_btn_clone,
-                    &next_btn_clone,
-                    1,
-                );
-            });
-        }
-        // Keyboard arrow nav on the root widget
-        let key_controller = gtk::EventControllerKey::new();
-        let current_doc_for_key = current_doc.clone();
-        let picture_for_key = picture.clone();
-        let info_for_key = page_info_label.clone();
-        let prev_for_key = prev_button.clone();
-        let next_for_key = next_button.clone();
-        key_controller.connect_key_pressed(move |_, key, _, _| {
-            let delta = match key {
-                gdk::Key::Left => -1,
-                gdk::Key::Right => 1,
-                _ => return glib::Propagation::Proceed,
-            };
-            navigate(
-                &current_doc_for_key,
-                &picture_for_key,
-                &info_for_key,
-                &prev_for_key,
-                &next_for_key,
-                delta,
-            );
-            glib::Propagation::Stop
+        // Update page info as the user scrolls.
+        let adj = scroll.vadjustment();
+        let info_for_scroll = page_info_label.clone();
+        let current_for_scroll = current_doc.clone();
+        adj.connect_value_changed(move |adj| {
+            if let Some(doc) = &*current_for_scroll.borrow() {
+                let idx = visible_page_index(adj, &doc.page_widgets);
+                info_for_scroll.set_text(&format!(
+                    "Page {} of {}",
+                    idx + 1,
+                    doc.page_widgets.len()
+                ));
+            }
         });
-        widget.add_controller(key_controller);
 
         Self {
             widget,
-            picture,
+            scroll,
+            pages_box,
             placeholder,
+            stack,
             page_info_label,
-            prev_button,
-            next_button,
             current_doc,
         }
     }
 
-    /// Load a document from `{sync_dir}/raw/{uuid}*` and display its first
-    /// page. Renders pages to SVG on first load and caches to disk.
     pub fn load_document(&self, uuid: &str, sync_dir: &Path) -> Result<()> {
+        self.clear_pages_box();
+
         let raw = sync_dir.join("raw");
         let cache = sync_dir.join(".rmsync").join("cache");
         std::fs::create_dir_all(&cache).ok();
@@ -178,52 +130,55 @@ impl DocumentViewer {
             .with_context(|| format!("reading {}", content_path.display()))?;
         let page_ids = content.pages.unwrap_or_default();
 
-        let mut pages = Vec::new();
         let mut cache_paths = Vec::new();
-        for page_id in &page_ids {
+        let mut page_widgets = Vec::new();
+        for (i, page_id) in page_ids.iter().enumerate() {
             let rm_path = raw.join(uuid).join(format!("{page_id}.rm"));
             if !rm_path.exists() {
                 continue;
             }
-            let bytes = std::fs::read(&rm_path)
-                .with_context(|| format!("reading {}", rm_path.display()))?;
-            let page = parse_rm_file(&bytes).map_err(anyhow::Error::from)?;
             let cache_path = cache.join(format!("{uuid}_{page_id}.svg"));
             if !cache_path.exists() {
+                let bytes = std::fs::read(&rm_path)
+                    .with_context(|| format!("reading {}", rm_path.display()))?;
+                let page = parse_rm_file(&bytes).map_err(anyhow::Error::from)?;
                 let svg = render_page_to_svg(&page);
                 std::fs::write(&cache_path, svg.as_bytes())
                     .with_context(|| format!("writing {}", cache_path.display()))?;
             }
-            pages.push(page);
+            let page_widget = build_page_widget(&cache_path, i + 1);
+            self.pages_box.append(&page_widget);
+            page_widgets.push(page_widget);
             cache_paths.push(cache_path);
         }
 
-        if pages.is_empty() {
+        if page_widgets.is_empty() {
             self.clear();
             return Ok(());
         }
 
-        let doc = LoadedDocument {
+        let total = page_widgets.len();
+        self.page_info_label.set_text(&format!("Page 1 of {total}"));
+        self.stack.set_visible_child_name("pages");
+        *self.current_doc.borrow_mut() = Some(LoadedDocument {
             uuid: uuid.to_string(),
-            name: uuid.to_string(),
-            pages,
             cache_paths,
-            current_page: 0,
-        };
-
-        display_page(&self.picture, &doc.cache_paths[0]);
-        update_navigation(&doc, &self.page_info_label, &self.prev_button, &self.next_button);
-        show_picture(&self.widget);
-        *self.current_doc.borrow_mut() = Some(doc);
+            page_widgets,
+        });
         Ok(())
     }
 
     pub fn clear(&self) {
+        self.clear_pages_box();
         *self.current_doc.borrow_mut() = None;
         self.page_info_label.set_text("");
-        self.prev_button.set_sensitive(false);
-        self.next_button.set_sensitive(false);
-        show_placeholder(&self.widget);
+        self.stack.set_visible_child_name("placeholder");
+    }
+
+    fn clear_pages_box(&self) {
+        while let Some(child) = self.pages_box.first_child() {
+            self.pages_box.remove(&child);
+        }
     }
 
     pub fn current_uuid(&self) -> Option<String> {
@@ -234,12 +189,29 @@ impl DocumentViewer {
         self.current_doc
             .borrow()
             .as_ref()
-            .map(|d| d.pages.len())
+            .map(|d| d.page_widgets.len())
             .unwrap_or(0)
     }
 
-    pub fn current_page_index(&self) -> Option<usize> {
-        self.current_doc.borrow().as_ref().map(|d| d.current_page)
+    pub fn scroll_to_page(&self, page_number: usize) {
+        let Some(doc) = &*self.current_doc.borrow() else {
+            return;
+        };
+        if page_number == 0 || page_number > doc.page_widgets.len() {
+            return;
+        }
+        let widget = &doc.page_widgets[page_number - 1];
+        let y = widget_y_in_box(widget);
+        let adj = self.scroll.vadjustment();
+        adj.set_value(y as f64);
+    }
+
+    pub fn current_visible_page(&self) -> usize {
+        let Some(doc) = &*self.current_doc.borrow() else {
+            return 0;
+        };
+        let adj = self.scroll.vadjustment();
+        visible_page_index(&adj, &doc.page_widgets) + 1
     }
 }
 
@@ -249,56 +221,62 @@ impl Default for DocumentViewer {
     }
 }
 
-fn display_page(picture: &gtk::Picture, svg_path: &Path) {
-    picture.set_filename(Some(svg_path));
-    picture.set_size_request(-1, -1);
+fn build_page_widget(svg_path: &Path, page_number: usize) -> gtk::Box {
+    let picture = gtk::Picture::for_filename(svg_path);
+    picture.set_content_fit(gtk::ContentFit::Contain);
+    picture.set_can_shrink(true);
+    picture.set_hexpand(true);
+    // Lock the intrinsic aspect so the scroll extent is correct before the
+    // SVG decodes.
+    picture.set_height_request(600);
+
+    let separator = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::Fill)
+        .build();
+    let left_rule = gtk::Separator::new(gtk::Orientation::Horizontal);
+    left_rule.set_hexpand(true);
+    left_rule.set_valign(gtk::Align::Center);
+    let label = gtk::Label::new(Some(&format!("Page {page_number}")));
+    label.add_css_class("dim-label");
+    let right_rule = gtk::Separator::new(gtk::Orientation::Horizontal);
+    right_rule.set_hexpand(true);
+    right_rule.set_valign(gtk::Align::Center);
+    separator.append(&left_rule);
+    separator.append(&label);
+    separator.append(&right_rule);
+
+    let page = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .build();
+    page.append(&separator);
+    page.append(&picture);
+    page
 }
 
-fn navigate(
-    current_doc: &Rc<RefCell<Option<LoadedDocument>>>,
-    picture: &gtk::Picture,
-    info_label: &gtk::Label,
-    prev: &gtk::Button,
-    next: &gtk::Button,
-    delta: i32,
-) {
-    let Some(doc) = &mut *current_doc.borrow_mut() else {
-        return;
-    };
-    let new_idx = (doc.current_page as i32 + delta).max(0) as usize;
-    if new_idx >= doc.pages.len() {
-        return;
+fn widget_y_in_box(widget: &gtk::Box) -> i32 {
+    widget.allocation().y()
+}
+
+fn visible_page_index(adj: &gtk::Adjustment, pages: &[gtk::Box]) -> usize {
+    if pages.is_empty() {
+        return 0;
     }
-    doc.current_page = new_idx;
-    display_page(picture, &doc.cache_paths[new_idx]);
-    update_navigation(doc, info_label, prev, next);
-}
-
-fn update_navigation(
-    doc: &LoadedDocument,
-    info: &gtk::Label,
-    prev: &gtk::Button,
-    next: &gtk::Button,
-) {
-    info.set_text(&format!(
-        "Page {} of {}",
-        doc.current_page + 1,
-        doc.pages.len()
-    ));
-    prev.set_sensitive(doc.current_page > 0);
-    next.set_sensitive(doc.current_page + 1 < doc.pages.len());
-}
-
-fn show_placeholder(widget: &gtk::Box) {
-    if let Some(stack) = widget.first_child().and_then(|w| w.downcast::<gtk::Stack>().ok()) {
-        stack.set_visible_child_name("placeholder");
+    let target = adj.value() + adj.page_size() / 2.0;
+    let mut best = 0usize;
+    let mut best_distance = f64::MAX;
+    for (i, w) in pages.iter().enumerate() {
+        let alloc = w.allocation();
+        let centre = alloc.y() as f64 + alloc.height() as f64 / 2.0;
+        let d = (centre - target).abs();
+        if d < best_distance {
+            best_distance = d;
+            best = i;
+        }
     }
-}
-
-fn show_picture(widget: &gtk::Box) {
-    if let Some(stack) = widget.first_child().and_then(|w| w.downcast::<gtk::Stack>().ok()) {
-        stack.set_visible_child_name("picture");
-    }
+    best
 }
 
 pub const REMARKABLE_PAGE_ASPECT: (i32, i32) = (REMARKABLE_PAGE_WIDTH, REMARKABLE_PAGE_HEIGHT);
@@ -309,7 +287,11 @@ mod tests {
 
     #[test]
     fn aspect_ratio_is_reMarkable_native() {
-        // 1404 x 1872 is the device viewport.
         assert_eq!(REMARKABLE_PAGE_ASPECT, (1404, 1872));
+    }
+
+    #[test]
+    fn inter_page_spacing_is_positive() {
+        assert!(INTER_PAGE_SPACING > 0);
     }
 }
