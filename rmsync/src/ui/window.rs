@@ -12,6 +12,7 @@ use crate::config::AppConfig;
 use crate::ui::device_status::DeviceStatusWidget;
 use crate::ui::folder_browser::FolderBrowser;
 use crate::ui::sync_controls::SyncControls;
+use crate::ui::viewer::DocumentViewer;
 
 const MIN_SIDEBAR_WIDTH: i32 = 200;
 const MIN_VIEWER_WIDTH: i32 = 400;
@@ -28,6 +29,7 @@ pub struct MainWindow {
     pub device_status: DeviceStatusWidget,
     pub sync_controls: SyncControls,
     pub folder_browser: FolderBrowser,
+    pub viewer: DocumentViewer,
 }
 
 impl MainWindow {
@@ -79,16 +81,12 @@ impl MainWindow {
             .build();
         sidebar_scroll.add_css_class("sidebar");
 
-        let viewer_placeholder = gtk::Label::builder()
-            .label("Select a document to view")
-            .halign(gtk::Align::Center)
-            .valign(gtk::Align::Center)
-            .build();
+        let viewer = DocumentViewer::new();
         let viewer_scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Automatic)
             .vscrollbar_policy(gtk::PolicyType::Automatic)
             .width_request(MIN_VIEWER_WIDTH)
-            .child(&viewer_placeholder)
+            .child(&viewer.widget)
             .build();
 
         let paned = gtk::Paned::builder()
@@ -124,6 +122,7 @@ impl MainWindow {
             device_status,
             sync_controls,
             folder_browser,
+            viewer,
         }
     }
 
