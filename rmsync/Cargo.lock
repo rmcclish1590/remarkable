@@ -2054,6 +2054,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "dirs",
+ "filetime",
  "gtk4",
  "libadwaita",
  "nom",
