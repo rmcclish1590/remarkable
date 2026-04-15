@@ -12,6 +12,8 @@ libadwaita = { version = "0.7", features = ["v1_2"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+async-channel = "2"
 
 # SSH/SFTP
 russh = "0.46"

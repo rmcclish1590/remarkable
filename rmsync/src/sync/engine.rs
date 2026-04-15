@@ -356,6 +356,288 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+// =========================================================================
+// Sync orchestrator (spec 22)
+// =========================================================================
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
+
+use tokio_util::sync::CancellationToken;
+
+use crate::config::AppConfig;
+use crate::device::connection::DeviceConnection;
+use crate::sync::scanner::{scan_local, scan_remote_with_progress, ScanProgress};
+use crate::sync::transfer::{
+    delete_local_document, delete_remote_document, pull_batch, push_batch, reload_xochitl,
+    resolve_all_conflicts, TransferProgress,
+};
+
+#[derive(Debug, Clone)]
+pub enum SyncPhase {
+    Connecting,
+    ScanningRemote,
+    ScanningLocal,
+    ComputingDiff,
+    Pulling,
+    Pushing,
+    Deleting,
+    ResolvingConflicts,
+    Finalizing,
+}
+
+#[derive(Debug, Clone)]
+pub enum SyncProgressEvent {
+    Phase(SyncPhase),
+    ScanProgress(ScanProgress),
+    TransferProgress(TransferProgress),
+    ConflictResolved(ConflictNotification),
+    Error(String),
+    Complete(SyncReport),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SyncReport {
+    pub pulled: usize,
+    pub pushed: usize,
+    pub deleted: usize,
+    pub conflicts_resolved: usize,
+    pub errors: Vec<String>,
+    pub duration_ms: u64,
+}
+
+impl SyncReport {
+    pub fn summary(&self) -> String {
+        format!(
+            "Sync complete: {} pulled, {} pushed, {} deleted, {} conflicts",
+            self.pulled, self.pushed, self.deleted, self.conflicts_resolved
+        )
+    }
+}
+
+pub struct SyncOrchestrator {
+    pub config: AppConfig,
+    pub db: StateDb,
+    pub connection: DeviceConnection,
+    pub cancel: CancellationToken,
+}
+
+impl SyncOrchestrator {
+    pub fn new(config: AppConfig) -> anyhow::Result<Self> {
+        let db_path = config.sync.sync_dir.join(".rmsync").join("state.db");
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let db = StateDb::open(&db_path)?;
+        let connection = DeviceConnection::new(config.to_connection_config());
+        Ok(Self {
+            config,
+            db,
+            connection,
+            cancel: CancellationToken::new(),
+        })
+    }
+
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    pub async fn run_sync(&mut self) -> anyhow::Result<SyncReport> {
+        self.run_sync_with_progress(|_| {}).await
+    }
+
+    pub async fn run_sync_with_progress<F>(&mut self, callback: F) -> anyhow::Result<SyncReport>
+    where
+        F: Fn(SyncProgressEvent) + Send + Sync + Clone + 'static,
+    {
+        let start = Instant::now();
+        let sync_dir = self.config.sync.sync_dir.clone();
+        let mut report = SyncReport::default();
+
+        // 1. Connect
+        callback(SyncProgressEvent::Phase(SyncPhase::Connecting));
+        if let Err(e) = self.connection.connect().await {
+            let msg = format!("connect failed: {e}");
+            callback(SyncProgressEvent::Error(msg.clone()));
+            report.errors.push(msg);
+            report.duration_ms = start.elapsed().as_millis() as u64;
+            callback(SyncProgressEvent::Complete(report.clone()));
+            return Ok(report);
+        }
+        if self.cancel.is_cancelled() {
+            return Ok(self.finalise(start, report, &callback).await);
+        }
+
+        // 2. Scan remote
+        callback(SyncProgressEvent::Phase(SyncPhase::ScanningRemote));
+        let scan_cb = callback.clone();
+        let remote = match scan_remote_with_progress(&self.connection, move |p| {
+            scan_cb(SyncProgressEvent::ScanProgress(p));
+        })
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                let msg = format!("remote scan failed: {e}");
+                callback(SyncProgressEvent::Error(msg.clone()));
+                report.errors.push(msg);
+                return Ok(self.finalise(start, report, &callback).await);
+            }
+        };
+        if self.cancel.is_cancelled() {
+            return Ok(self.finalise(start, report, &callback).await);
+        }
+
+        // 3. Scan local
+        callback(SyncProgressEvent::Phase(SyncPhase::ScanningLocal));
+        let local = match scan_local(&sync_dir) {
+            Ok(m) => m,
+            Err(e) => {
+                let msg = format!("local scan failed: {e}");
+                callback(SyncProgressEvent::Error(msg.clone()));
+                report.errors.push(msg);
+                return Ok(self.finalise(start, report, &callback).await);
+            }
+        };
+
+        // 4. Compute diff
+        callback(SyncProgressEvent::Phase(SyncPhase::ComputingDiff));
+        let plan = match compute_sync_plan(&local, &remote, &self.db) {
+            Ok(p) => p,
+            Err(e) => {
+                let msg = format!("diff failed: {e}");
+                callback(SyncProgressEvent::Error(msg.clone()));
+                report.errors.push(msg);
+                return Ok(self.finalise(start, report, &callback).await);
+            }
+        };
+
+        // 5. Resolve conflicts
+        if plan.has_conflicts() && !self.cancel.is_cancelled() {
+            callback(SyncProgressEvent::Phase(SyncPhase::ResolvingConflicts));
+            match resolve_all_conflicts(&self.connection, &plan, &local, &remote, &sync_dir, &self.db).await {
+                Ok(resolutions) => {
+                    report.conflicts_resolved = resolutions.len();
+                    for r in resolutions {
+                        callback(SyncProgressEvent::ConflictResolved(r.to_notification()));
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("conflict resolution failed: {e}");
+                    callback(SyncProgressEvent::Error(msg.clone()));
+                    report.errors.push(msg);
+                }
+            }
+        }
+
+        // 6. Pulls
+        if plan.total_pull > 0 && !self.cancel.is_cancelled() {
+            callback(SyncProgressEvent::Phase(SyncPhase::Pulling));
+            let tcb = callback.clone();
+            match pull_batch(&self.connection, &plan, &sync_dir, &self.db, move |p| {
+                tcb(SyncProgressEvent::TransferProgress(p));
+            })
+            .await
+            {
+                Ok(results) => {
+                    report.pulled = results.iter().filter(|r| r.success).count();
+                    for r in results.iter().filter(|r| !r.success) {
+                        if let Some(e) = &r.error {
+                            report.errors.push(format!("pull {}: {e}", r.uuid));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("pull batch failed: {e}");
+                    callback(SyncProgressEvent::Error(msg.clone()));
+                    report.errors.push(msg);
+                }
+            }
+        }
+
+        // 7. Pushes
+        if plan.total_push > 0 && !self.cancel.is_cancelled() {
+            callback(SyncProgressEvent::Phase(SyncPhase::Pushing));
+            let tcb = callback.clone();
+            match push_batch(&self.connection, &plan, &sync_dir, &self.db, move |p| {
+                tcb(SyncProgressEvent::TransferProgress(p));
+            })
+            .await
+            {
+                Ok(results) => {
+                    report.pushed = results.iter().filter(|r| r.success).count();
+                    for r in results.iter().filter(|r| !r.success) {
+                        if let Some(e) = &r.error {
+                            report.errors.push(format!("push {}: {e}", r.uuid));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("push batch failed: {e}");
+                    callback(SyncProgressEvent::Error(msg.clone()));
+                    report.errors.push(msg);
+                }
+            }
+        }
+
+        // 8. Deletes
+        if plan.total_delete > 0 && !self.cancel.is_cancelled() {
+            callback(SyncProgressEvent::Phase(SyncPhase::Deleting));
+            for action in plan.actions.iter() {
+                match &action.action_type {
+                    SyncActionType::DeleteLocal => {
+                        if let Err(e) = delete_local_document(&action.uuid, &sync_dir) {
+                            report.errors.push(format!("delete local {}: {e}", action.uuid));
+                        } else {
+                            let _ = self.db.delete_state(&action.uuid);
+                            report.deleted += 1;
+                        }
+                    }
+                    SyncActionType::DeleteRemote => {
+                        if let Err(e) = delete_remote_document(&self.connection, &action.uuid).await {
+                            report.errors.push(format!("delete remote {}: {e}", action.uuid));
+                        } else {
+                            let _ = self.db.delete_state(&action.uuid);
+                            report.deleted += 1;
+                        }
+                    }
+                    SyncActionType::DeleteBoth => {
+                        let _ = delete_local_document(&action.uuid, &sync_dir);
+                        let _ = delete_remote_document(&self.connection, &action.uuid).await;
+                        let _ = self.db.delete_state(&action.uuid);
+                        report.deleted += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // 9. Reload xochitl
+        if (plan.total_push > 0 || plan.total_delete > 0) && !self.cancel.is_cancelled() {
+            let _ = reload_xochitl(&mut self.connection).await;
+        }
+
+        Ok(self.finalise(start, report, &callback).await)
+    }
+
+    async fn finalise<F>(
+        &mut self,
+        start: Instant,
+        mut report: SyncReport,
+        callback: &F,
+    ) -> SyncReport
+    where
+        F: Fn(SyncProgressEvent) + Send + Sync + Clone + 'static,
+    {
+        callback(SyncProgressEvent::Phase(SyncPhase::Finalizing));
+        self.connection.disconnect().await;
+        report.duration_ms = start.elapsed().as_millis() as u64;
+        callback(SyncProgressEvent::Complete(report.clone()));
+        report
+    }
+}
+
 fn action_rank(a: &SyncActionType) -> u8 {
     match a {
         SyncActionType::Pull => 0,
