@@ -65,3 +65,23 @@ filetime = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+
+[package.metadata.deb]
+maintainer = "rmSync Contributors"
+copyright = "2026, rmSync Contributors"
+license-file = ["LICENSE", "0"]
+extended-description = """
+rmSync provides bi-directional synchronization between a reMarkable 2 \
+tablet and a Linux desktop. It detects the tablet over USB, syncs \
+documents in both directions, and includes a built-in viewer for \
+handwritten notebooks and PDFs."""
+section = "utils"
+priority = "optional"
+depends = "$auto, openssh-client"
+maintainer-scripts = "assets/"
+assets = [
+    ["target/release/rmsync", "usr/bin/", "755"],
+    ["assets/rmsync.desktop", "usr/share/applications/", "644"],
+    ["assets/rmsync.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["assets/99-remarkable.rules", "etc/udev/rules.d/", "644"],
+]

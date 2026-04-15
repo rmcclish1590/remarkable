@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=rmSync
+GenericName=reMarkable Sync
+Comment=Bi-directional sync for reMarkable 2
+Exec=rmsync
+Icon=rmsync
+Terminal=false
+Type=Application
+Categories=Utility;FileTools;
+Keywords=remarkable;sync;tablet;notes;
+StartupNotify=true
