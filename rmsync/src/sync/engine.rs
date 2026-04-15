@@ -330,6 +330,10 @@ fn conflict_date_string(unix: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+pub fn civil_from_days_public(days_since_epoch: i64) -> (i32, u32, u32) {
+    civil_from_days(days_since_epoch)
+}
+
 fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
     let z = days_since_epoch + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
