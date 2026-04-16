@@ -1,0 +1,5 @@
+# reMarkable 2 USB detection rule.
+# Tags the virtual network interface created when the tablet is plugged in
+# so rmSync and other tools can identify it. rmSync itself watches udev
+# events internally; this rule is advisory.
+SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="04b3", TAG+="remarkable"

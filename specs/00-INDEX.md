@@ -44,6 +44,11 @@ LAYER 6 — Integration (depends on all above)       │
                                                    │
 LAYER 7 — Packaging                                │
   25-deb-packaging ────────────────────────────────┘
+
+LAYER 8 — Real-Device Fixes (post-first-sync)
+  26-content-v2-parser ──── (critical, blocks viewer)
+  27-viewer-error-handling ── (depends on 26)
+  28-self-contained-svg-rendering ── (depends on 26)
 ```
 
 ## Parallelization Opportunities

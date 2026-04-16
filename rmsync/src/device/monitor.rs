@@ -122,7 +122,7 @@ fn spawn_udev_thread(
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
     std::thread::spawn(move || {
-        let mut socket = match udev::MonitorBuilder::new()
+        let socket = match udev::MonitorBuilder::new()
             .and_then(|b| b.match_subsystem("net"))
             .and_then(|b| b.listen())
         {
@@ -251,10 +251,9 @@ mod tests {
         monitor.check_now().await;
         assert_eq!(monitor.state(), DeviceState::Disconnected);
         // No event should fire on a no-op transition.
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_millis(100), rx.recv()).await,
-            Err(_)
-        ));
+        assert!(tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .is_err());
     }
 
     #[tokio::test]

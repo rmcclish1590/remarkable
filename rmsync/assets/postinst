@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+
+# Reload udev rules so the reMarkable rule takes effect without reboot.
+udevadm control --reload-rules || true
+udevadm trigger || true
+
+# Refresh icon + desktop caches so the launcher sees the new entry.
+if [ -x "$(command -v gtk-update-icon-cache)" ]; then
+  gtk-update-icon-cache -f /usr/share/icons/hicolor/ || true
+fi
+if [ -x "$(command -v update-desktop-database)" ]; then
+  update-desktop-database /usr/share/applications/ || true
+fi
+
+exit 0

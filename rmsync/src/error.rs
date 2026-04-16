@@ -1,7 +1,7 @@
 //! Application-wide error type.
 
 /// Top-level error enum used across rmsync modules.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Error;
 
 impl Error {

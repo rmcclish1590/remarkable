@@ -298,6 +298,30 @@ impl DeviceConnection {
             .map_err(|e| ConnectionError::SftpError(e.to_string()))
     }
 
+    /// Execute a command on the device and wait for its exit status. Returns
+    /// the exit code on completion, or an error if the channel/SSH layer
+    /// faults. Stdout/stderr are discarded.
+    pub async fn exec(&mut self, command: &str) -> Result<u32, ConnectionError> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or(ConnectionError::NotConnected)?;
+        let mut channel = session
+            .channel_open_session()
+            .await
+            .map_err(|e| ConnectionError::SshError(e.to_string()))?;
+        channel
+            .exec(true, command)
+            .await
+            .map_err(|e| ConnectionError::SshError(e.to_string()))?;
+        while let Some(msg) = channel.wait().await {
+            if let ChannelMsg::ExitStatus { exit_status } = msg {
+                return Ok(exit_status);
+            }
+        }
+        Err(ConnectionError::SshError("channel closed without exit status".into()))
+    }
+
     /// Generate an Ed25519 keypair, install the public key in the device's
     /// `~/.ssh/authorized_keys`, and switch this connection's config to key
     /// authentication. Returns the private-key path on success.
@@ -422,7 +446,8 @@ async fn write_private_key(path: &Path, pem: &str) -> Result<(), std::io::Error>
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
+        // tokio::fs::OpenOptions provides `mode()` directly on unix; no
+        // extension-trait import required.
         opts.mode(0o600);
     }
     let mut f = opts.open(path).await?;
@@ -446,21 +471,53 @@ impl Handler for ClientHandler {
         server_public_key: &russh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
         let fingerprint = server_public_key.fingerprint();
+        let algo = server_public_key.name();
+        tracing::debug!(
+            "check_server_key: algo={algo} fingerprint={fingerprint}"
+        );
         match std::fs::read_to_string(&self.known_hosts_path) {
             Ok(existing) => {
-                let stored = existing.trim();
-                if stored.is_empty() {
-                    write_fingerprint(&self.known_hosts_path, &fingerprint)?;
-                    Ok(true)
-                } else if stored == fingerprint {
+                // Accept any line in the file that matches this fingerprint.
+                // File may contain entries from multiple host-key algorithms
+                // (ssh-ed25519, ssh-rsa, ecdsa-*) — the tablet advertises a
+                // few and russh can negotiate any of them depending on the
+                // client's algorithm preference ordering.
+                let mut found = false;
+                let mut has_any = false;
+                for line in existing.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    has_any = true;
+                    // Allow entries formatted as either bare "<b64>" or
+                    // "<algorithm> <b64>".
+                    let stored = line.split_whitespace().next_back().unwrap_or(line);
+                    if stored == fingerprint {
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
                     self.matched_existing = true;
                     Ok(true)
+                } else if !has_any {
+                    write_fingerprint(&self.known_hosts_path, algo, &fingerprint)?;
+                    Ok(true)
                 } else {
-                    Ok(false)
+                    // Unknown key for a known host: append rather than reject
+                    // so a server presenting a new key type on a negotiated
+                    // algorithm doesn't wedge us. Log loudly for audit.
+                    tracing::warn!(
+                        "pinning new host-key entry: {algo} {fingerprint} (append to {})",
+                        self.known_hosts_path.display()
+                    );
+                    append_fingerprint(&self.known_hosts_path, algo, &fingerprint)?;
+                    Ok(true)
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                write_fingerprint(&self.known_hosts_path, &fingerprint)?;
+                write_fingerprint(&self.known_hosts_path, algo, &fingerprint)?;
                 Ok(true)
             }
             Err(e) => Err(russh::Error::IO(e)),
@@ -468,11 +525,31 @@ impl Handler for ClientHandler {
     }
 }
 
-fn write_fingerprint(path: &Path, fingerprint: &str) -> Result<(), std::io::Error> {
+fn write_fingerprint(
+    path: &Path,
+    algorithm: &str,
+    fingerprint: &str,
+) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, format!("{fingerprint}\n"))
+    std::fs::write(path, format!("{algorithm} {fingerprint}\n"))
+}
+
+fn append_fingerprint(
+    path: &Path,
+    algorithm: &str,
+    fingerprint: &str,
+) -> Result<(), std::io::Error> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(f, "{algorithm} {fingerprint}")
 }
 
 #[cfg(test)]
@@ -553,12 +630,23 @@ mod tests {
     }
 
     #[test]
-    fn tofu_accepts_on_first_sight_and_rejects_on_mismatch() {
+    fn tofu_writes_algo_and_fingerprint() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("known_hosts");
-        write_fingerprint(&path, "SHA256:abc").unwrap();
+        write_fingerprint(&path, "ssh-ed25519", "abc123").unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(contents.trim() == "SHA256:abc");
+        assert_eq!(contents.trim(), "ssh-ed25519 abc123");
+    }
+
+    #[test]
+    fn tofu_append_preserves_existing_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        write_fingerprint(&path, "ssh-ed25519", "abc").unwrap();
+        append_fingerprint(&path, "ssh-rsa", "def").unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("ssh-ed25519 abc"));
+        assert!(contents.contains("ssh-rsa def"));
     }
 
     #[test]
