@@ -83,6 +83,7 @@ fn classify_node(node: &DocumentNode) -> TreeItemType {
 
 type SelectedCallback = Rc<RefCell<Option<Box<dyn Fn(String)>>>>;
 
+#[derive(Clone)]
 pub struct FolderBrowser {
     pub widget: gtk::Box,
     root_store: gio::ListStore,
@@ -313,6 +314,7 @@ mod tests {
             orientation: None,
             page_count: pages,
             pages: None,
+            c_pages: None,
             text_scale: None,
         });
         DocumentNode {

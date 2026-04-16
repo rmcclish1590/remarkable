@@ -71,6 +71,9 @@ pub async fn pull_document(
     let mut first_err: Option<String> = None;
 
     for f in &remote_files {
+        if f.is_dir {
+            continue;
+        }
         let local_path = match safe_local_path_for(&raw, uuid, &f.path) {
             Some(p) => p,
             None => {

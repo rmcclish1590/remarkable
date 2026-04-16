@@ -14,6 +14,7 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::config::AppConfig;
+use crate::device::connection::{AuthMethod, DeviceConnection};
 use crate::sync::transfer::TransferProgress;
 
 /// Wire the Browse button to a folder-chooser dialog. The returned entry is
@@ -46,7 +47,11 @@ pub fn setup_folder_selector(
                     let Some(path) = file.path() else { return };
                     match apply_sync_dir(&config, &path) {
                         Ok(()) => path_entry.set_text(&path.to_string_lossy()),
-                        Err(e) => show_error_dialog(&window_for_dialog, &e.to_string()),
+                        Err(e) => show_error_dialog_with_heading(
+                            &window_for_dialog,
+                            "Cannot use that folder",
+                            &e.to_string(),
+                        ),
                     }
                 }
                 Err(e) => {
@@ -59,7 +64,11 @@ pub fn setup_folder_selector(
                     {
                         return;
                     }
-                    show_error_dialog(&window_for_dialog, msg);
+                    show_error_dialog_with_heading(
+                        &window_for_dialog,
+                        "Cannot use that folder",
+                        msg,
+                    );
                 }
             },
         );
@@ -80,10 +89,18 @@ pub fn apply_sync_dir(config: &Rc<RefCell<AppConfig>>, path: &Path) -> anyhow::R
 }
 
 fn show_error_dialog(window: &adw::ApplicationWindow, message: &str) {
+    show_error_dialog_with_heading(window, "Something went wrong", message);
+}
+
+fn show_error_dialog_with_heading(
+    window: &adw::ApplicationWindow,
+    heading: &str,
+    message: &str,
+) {
     let dialog = adw::MessageDialog::builder()
         .transient_for(window)
         .modal(true)
-        .heading("Cannot use that folder")
+        .heading(heading)
         .body(message)
         .build();
     dialog.add_response("ok", "_OK");
@@ -97,6 +114,152 @@ fn show_error_dialog(window: &adw::ApplicationWindow, message: &str) {
 pub fn sync_entry_initial_state(path_entry: &gtk::Entry, config: &AppConfig) {
     path_entry.set_text(&config.sync.sync_dir.to_string_lossy());
     let _ = config.ensure_directories();
+}
+
+/// Prompt for the reMarkable's root password, try to connect, install an
+/// Ed25519 keypair for future passwordless logins, and persist the
+/// resulting `key_path` to config. `on_ready` fires on the GTK main
+/// thread once the device is configured (or immediately if a key is
+/// already set). On cancel or failure `on_ready` is NOT called.
+pub fn ensure_device_configured<F: Fn() + 'static>(
+    window: &adw::ApplicationWindow,
+    config: Rc<RefCell<AppConfig>>,
+    on_ready: F,
+) {
+    if config.borrow().device.key_path.is_some() {
+        on_ready();
+        return;
+    }
+
+    let dialog = adw::MessageDialog::builder()
+        .transient_for(window)
+        .modal(true)
+        .heading("Set up reMarkable access")
+        .body(
+            "First-time connection — enter your tablet's SSH password.\n\n\
+             On the tablet: Settings → Help → Copyrights and licenses. \
+             Scroll to the bottom — the root password is listed under \
+             GPLv3 Compliance (older firmware: Settings → General → \
+             Software → \"Developer Mode\" must be enabled first).\n\n\
+             This password is used once to install an SSH key — future \
+             syncs will be automatic.",
+        )
+        .build();
+
+    let entry = gtk::PasswordEntry::builder()
+        .show_peek_icon(true)
+        .margin_top(8)
+        .margin_bottom(8)
+        .margin_start(16)
+        .margin_end(16)
+        .build();
+    dialog.set_extra_child(Some(&entry));
+
+    dialog.add_response("cancel", "_Cancel");
+    dialog.add_response("connect", "_Connect");
+    dialog.set_response_appearance("connect", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("connect"));
+    dialog.set_close_response("cancel");
+
+    let window_for_error = window.clone();
+    let on_ready = Rc::new(on_ready);
+    let entry_for_response = entry.clone();
+    dialog.connect_response(None, move |dialog, response| {
+        if response != "connect" {
+            dialog.close();
+            return;
+        }
+        let password = entry_for_response.text().to_string();
+        if password.is_empty() {
+            show_error_dialog_with_heading(
+                &window_for_error,
+                "Password required",
+                "Password cannot be empty.",
+            );
+            return;
+        }
+        dialog.close();
+        run_setup_key_auth(
+            &window_for_error,
+            config.clone(),
+            password,
+            on_ready.clone(),
+        );
+    });
+
+    dialog.present();
+}
+
+fn run_setup_key_auth<F: Fn() + 'static>(
+    window: &adw::ApplicationWindow,
+    config: Rc<RefCell<AppConfig>>,
+    password: String,
+    on_ready: Rc<F>,
+) {
+    let (result_tx, result_rx) = async_channel::bounded::<Result<std::path::PathBuf, String>>(1);
+    let conn_config = {
+        let mut cc = config.borrow().to_connection_config();
+        cc.auth = AuthMethod::Password(password);
+        cc
+    };
+    std::thread::spawn(move || {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = result_tx.send_blocking(Err(format!("runtime: {e}")));
+                return;
+            }
+        };
+        runtime.block_on(async move {
+            let mut conn = DeviceConnection::new(conn_config);
+            if let Err(e) = conn.connect().await {
+                let _ = result_tx.send(Err(format!("connect: {e}"))).await;
+                return;
+            }
+            match conn.setup_key_auth().await {
+                Ok(key_path) => {
+                    conn.disconnect().await;
+                    let _ = result_tx.send(Ok(key_path)).await;
+                }
+                Err(e) => {
+                    conn.disconnect().await;
+                    let _ = result_tx.send(Err(format!("install key: {e}"))).await;
+                }
+            }
+        });
+    });
+
+    let window = window.clone();
+    let on_ready = on_ready.clone();
+    glib::spawn_future_local(async move {
+        match result_rx.recv().await {
+            Ok(Ok(key_path)) => {
+                {
+                    let mut cfg = config.borrow_mut();
+                    cfg.device.key_path = Some(key_path);
+                    let _ = cfg.save();
+                }
+                on_ready();
+            }
+            Ok(Err(msg)) => {
+                show_error_dialog_with_heading(
+                    &window,
+                    "SSH setup failed",
+                    &format!("{msg}\n\nTip: if this mentions \"Unknown server key\", try deleting ~/.config/rmsync/known_hosts and retrying."),
+                );
+            }
+            Err(_) => {
+                show_error_dialog_with_heading(
+                    &window,
+                    "SSH setup failed",
+                    "Setup task exited unexpectedly.",
+                );
+            }
+        }
+    });
 }
 
 // =========================================================================

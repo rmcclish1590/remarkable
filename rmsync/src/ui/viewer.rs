@@ -1,4 +1,5 @@
 //! Document viewer panel — continuous multi-page scroll (spec 21).
+//! Error handling and diagnostic feedback (spec 27).
 //!
 //! Each page of the currently loaded notebook gets its own `GtkPicture`
 //! showing the cached SVG under `{sync_dir}/.rmsync/cache/`. Pictures are
@@ -8,10 +9,12 @@
 //! page counter based on viewport centre.
 
 use std::cell::RefCell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use anyhow::{Context, Result};
+use gtk::gdk;
+use gtk::glib;
 use gtk::prelude::*;
 
 use crate::remarkable::metadata::RemarkableContent;
@@ -33,6 +36,9 @@ pub struct DocumentViewer {
     pub widget: gtk::Box,
     scroll: gtk::ScrolledWindow,
     pages_box: gtk::Box,
+    error_box: gtk::Box,
+    error_heading: gtk::Label,
+    error_detail: gtk::Label,
     stack: gtk::Stack,
     page_info_label: gtk::Label,
     current_doc: Rc<RefCell<Option<LoadedDocument>>>,
@@ -65,11 +71,42 @@ impl DocumentViewer {
             .build();
         placeholder.add_css_class("dim-label");
 
+        // Error pane — shown when load_document fails entirely.
+        let error_icon = gtk::Image::builder()
+            .icon_name("dialog-warning-symbolic")
+            .pixel_size(48)
+            .margin_bottom(12)
+            .build();
+        let error_heading = gtk::Label::builder()
+            .halign(gtk::Align::Center)
+            .build();
+        error_heading.add_css_class("title-3");
+        let error_detail = gtk::Label::builder()
+            .halign(gtk::Align::Center)
+            .wrap(true)
+            .selectable(true)
+            .build();
+        error_detail.add_css_class("dim-label");
+        let error_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(4)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .hexpand(true)
+            .vexpand(true)
+            .margin_start(32)
+            .margin_end(32)
+            .build();
+        error_box.append(&error_icon);
+        error_box.append(&error_heading);
+        error_box.append(&error_detail);
+
         let stack = gtk::Stack::builder()
             .transition_type(gtk::StackTransitionType::Crossfade)
             .build();
         stack.add_named(&placeholder, Some("placeholder"));
         stack.add_named(&scroll, Some("pages"));
+        stack.add_named(&error_box, Some("error"));
         stack.set_visible_child_name("placeholder");
         stack.set_vexpand(true);
         stack.set_hexpand(true);
@@ -90,7 +127,6 @@ impl DocumentViewer {
 
         let current_doc: Rc<RefCell<Option<LoadedDocument>>> = Rc::new(RefCell::new(None));
 
-        // Update page info as the user scrolls.
         let adj = scroll.vadjustment();
         let info_for_scroll = page_info_label.clone();
         let current_for_scroll = current_doc.clone();
@@ -109,51 +145,109 @@ impl DocumentViewer {
             widget,
             scroll,
             pages_box,
+            error_box,
+            error_heading,
+            error_detail,
             stack,
             page_info_label,
             current_doc,
         }
     }
 
+    /// Show an error message inside the viewer pane (no dialog needed).
+    pub fn show_error(&self, heading: &str, detail: &str) {
+        self.error_heading.set_text(heading);
+        self.error_detail.set_text(detail);
+        self.page_info_label.set_text("");
+        self.stack.set_visible_child_name("error");
+    }
+
+    /// Load and display a document from the local sync directory.
+    /// Resilient: attempts every page and accumulates per-page failures
+    /// instead of aborting on the first error.
     pub fn load_document(&self, uuid: &str, sync_dir: &Path) -> Result<()> {
         self.clear_pages_box();
 
         let raw = sync_dir.join("raw");
         let cache = sync_dir.join(".rmsync").join("cache");
-        std::fs::create_dir_all(&cache).ok();
+        std::fs::create_dir_all(&cache)
+            .with_context(|| format!("creating cache dir {}", cache.display()))?;
 
         let content_path = raw.join(format!("{uuid}.content"));
         let content = RemarkableContent::from_file(&content_path)
             .with_context(|| format!("reading {}", content_path.display()))?;
-        let page_ids = content.pages.unwrap_or_default();
+        let page_ids = content.page_ids();
+
+        if page_ids.is_empty() {
+            self.show_error(
+                "No pages found",
+                "This document's .content file lists zero pages.",
+            );
+            return Ok(());
+        }
 
         let mut page_widgets = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
         for (i, page_id) in page_ids.iter().enumerate() {
             let rm_path = raw.join(uuid).join(format!("{page_id}.rm"));
             if !rm_path.exists() {
+                failures.push(format!("page {}: .rm file not found", i + 1));
                 continue;
             }
             let cache_path = cache.join(format!("{uuid}_{page_id}.svg"));
             if !cache_path.exists() {
-                let bytes = std::fs::read(&rm_path)
-                    .with_context(|| format!("reading {}", rm_path.display()))?;
-                let page = parse_rm_file(&bytes).map_err(anyhow::Error::from)?;
-                let svg = render_page_to_svg(&page);
-                std::fs::write(&cache_path, svg.as_bytes())
-                    .with_context(|| format!("writing {}", cache_path.display()))?;
+                match render_and_cache(&rm_path, &cache_path) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        failures.push(format!("page {}: {e}", i + 1));
+                        continue;
+                    }
+                }
+            }
+            if !cache_path.exists() {
+                failures.push(format!("page {}: SVG cache missing after render", i + 1));
+                continue;
             }
             let page_widget = build_page_widget(&cache_path, i + 1);
             self.pages_box.append(&page_widget);
             page_widgets.push(page_widget);
         }
 
-        if page_widgets.is_empty() {
-            self.clear();
+        let rendered = page_widgets.len();
+        let total = page_ids.len();
+
+        if rendered == 0 {
+            let detail = if failures.is_empty() {
+                "All page .rm files are missing from the sync directory.".to_string()
+            } else {
+                failures.join("\n")
+            };
+            self.show_error(
+                &format!("Could not render any of {total} pages"),
+                &detail,
+            );
             return Ok(());
         }
 
-        let total = page_widgets.len();
-        self.page_info_label.set_text(&format!("Page 1 of {total}"));
+        if !failures.is_empty() {
+            let warning = gtk::Label::builder()
+                .label(&format!(
+                    "⚠ {rendered} of {total} pages rendered — {} failed:\n{}",
+                    failures.len(),
+                    failures.join("\n")
+                ))
+                .wrap(true)
+                .halign(gtk::Align::Start)
+                .margin_start(16)
+                .margin_end(16)
+                .margin_bottom(8)
+                .build();
+            warning.add_css_class("warning");
+            self.pages_box.prepend(&warning);
+        }
+
+        self.page_info_label
+            .set_text(&format!("Page 1 of {rendered}"));
         self.stack.set_visible_child_name("pages");
         *self.current_doc.borrow_mut() = Some(LoadedDocument {
             uuid: uuid.to_string(),
@@ -215,14 +309,60 @@ impl Default for DocumentViewer {
     }
 }
 
+fn svg_to_texture(svg_path: &Path) -> Result<gdk::MemoryTexture> {
+    let svg_bytes = std::fs::read(svg_path)
+        .with_context(|| format!("reading {}", svg_path.display()))?;
+    let options = resvg::usvg::Options::default();
+    let tree = resvg::usvg::Tree::from_data(&svg_bytes, &options)
+        .with_context(|| "parsing SVG")?;
+    let size = tree.size();
+    let width = size.width() as u32;
+    let height = size.height() as u32;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
+        .ok_or_else(|| anyhow::anyhow!("pixmap allocation failed ({width}x{height})"))?;
+    resvg::render(&tree, resvg::tiny_skia::Transform::default(), &mut pixmap.as_mut());
+    let bytes = glib::Bytes::from(pixmap.data());
+    let texture = gdk::MemoryTexture::new(
+        width as i32,
+        height as i32,
+        gdk::MemoryFormat::R8g8b8a8Premultiplied,
+        &bytes,
+        (width * 4) as usize,
+    );
+    Ok(texture)
+}
+
+fn render_and_cache(rm_path: &Path, cache_path: &Path) -> Result<()> {
+    let bytes = std::fs::read(rm_path)
+        .with_context(|| format!("reading {}", rm_path.display()))?;
+    let page = parse_rm_file(&bytes).map_err(anyhow::Error::from)?;
+    let svg = render_page_to_svg(&page);
+    std::fs::write(cache_path, svg.as_bytes())
+        .with_context(|| format!("writing {}", cache_path.display()))?;
+    Ok(())
+}
+
 fn build_page_widget(svg_path: &Path, page_number: usize) -> gtk::Box {
-    let picture = gtk::Picture::for_filename(svg_path);
-    picture.set_content_fit(gtk::ContentFit::Contain);
-    picture.set_can_shrink(true);
-    picture.set_hexpand(true);
-    // Lock the intrinsic aspect so the scroll extent is correct before the
-    // SVG decodes.
-    picture.set_height_request(600);
+    let picture = match svg_to_texture(svg_path) {
+        Ok(texture) => {
+            let p = gtk::Picture::for_paintable(&texture);
+            p.set_content_fit(gtk::ContentFit::Contain);
+            p.set_can_shrink(true);
+            p.set_hexpand(true);
+            p
+        }
+        Err(e) => {
+            tracing::warn!("page {page_number}: SVG render failed: {e}");
+            let label = gtk::Label::new(Some(&format!(
+                "Page {page_number}: render failed — {e}"
+            )));
+            label.add_css_class("dim-label");
+            let p = gtk::Picture::new();
+            p.set_hexpand(true);
+            p.set_height_request(200);
+            p
+        }
+    };
 
     let separator = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)

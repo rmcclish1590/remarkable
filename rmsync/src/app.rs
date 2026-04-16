@@ -24,7 +24,7 @@ use crate::remarkable::document::DocumentTree;
 use crate::sync::engine::{SyncOrchestrator, SyncPhase, SyncProgressEvent};
 use crate::ui::device_status::DeviceStatusWidget;
 use crate::ui::folder_browser::FolderBrowser;
-use crate::ui::sync_controls::{setup_folder_selector, SyncControls};
+use crate::ui::sync_controls::{ensure_device_configured, setup_folder_selector, SyncControls};
 use crate::ui::viewer::DocumentViewer;
 use crate::ui::window::MainWindow;
 
@@ -71,6 +71,7 @@ impl RmSyncApp {
                 &main.folder_browser,
                 &main.viewer,
                 main.last_sync_label.clone(),
+                main.window.clone(),
                 config_for_activate.clone(),
             );
             setup_device_monitoring(
@@ -128,103 +129,134 @@ fn wire_folder_browser_to_viewer(
         let sync_dir = config.borrow().sync.sync_dir.clone();
         if let Err(e) = viewer.load_document(&uuid, &sync_dir) {
             tracing::warn!("failed to open {uuid}: {e}");
+            viewer.show_error("Could not open document", &e.to_string());
         }
     });
 }
 
 pub(crate) fn wire_sync_button(
     sync_controls: &SyncControls,
-    _folder_browser: &FolderBrowser,
+    folder_browser: &FolderBrowser,
     _viewer: &DocumentViewer,
     last_sync_label: gtk::Label,
+    window: adw::ApplicationWindow,
     config: Rc<RefCell<AppConfig>>,
 ) {
     let controls = sync_controls.clone();
-    let controls_clone = sync_controls.clone();
-    let browser_reload_cfg = config.clone();
+    let browser = folder_browser.clone();
     sync_controls.connect_sync_clicked(move || {
-        let cfg = config.borrow().clone();
-        let (tx, rx) = async_channel::unbounded::<SyncProgressEvent>();
-        controls.start_sync();
-        // Sync state (rusqlite Connection) is not Sync, so we run the
-        // orchestrator on a dedicated std::thread with its own
-        // current-thread tokio runtime — the whole orchestrator lives on
-        // that thread and only sends events back through an async channel.
-        std::thread::spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
+        // If SSH is not yet set up, prompt for the root password first.
+        // ensure_device_configured runs the sync-start closure only after
+        // the keypair is successfully installed and saved.
+        let controls = controls.clone();
+        let browser = browser.clone();
+        let config = config.clone();
+        let last_sync_label = last_sync_label.clone();
+        ensure_device_configured(&window, config.clone(), move || {
+            start_sync(
+                controls.clone(),
+                browser.clone(),
+                last_sync_label.clone(),
+                config.clone(),
+            );
+        });
+    });
+}
+
+fn start_sync(
+    controls: SyncControls,
+    browser: FolderBrowser,
+    last_sync_label: gtk::Label,
+    config: Rc<RefCell<AppConfig>>,
+) {
+    let cfg = config.borrow().clone();
+    let (tx, rx) = async_channel::unbounded::<SyncProgressEvent>();
+    controls.start_sync();
+
+    // Sync state (rusqlite Connection) is not Sync, so we run the
+    // orchestrator on a dedicated std::thread with its own current-thread
+    // tokio runtime — the whole orchestrator lives on that thread and only
+    // sends events back through the async channel.
+    std::thread::spawn(move || {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = tx.send_blocking(SyncProgressEvent::Error(format!("runtime: {e}")));
+                let _ = tx.send_blocking(SyncProgressEvent::Complete(Default::default()));
+                return;
+            }
+        };
+        runtime.block_on(async move {
+            let mut orch = match SyncOrchestrator::new(cfg) {
+                Ok(o) => o,
                 Err(e) => {
-                    let _ = tx.send_blocking(SyncProgressEvent::Error(format!("runtime: {e}")));
-                    let _ = tx.send_blocking(SyncProgressEvent::Complete(Default::default()));
+                    let _ = tx.send(SyncProgressEvent::Error(format!("init: {e}"))).await;
+                    let _ = tx
+                        .send(SyncProgressEvent::Complete(Default::default()))
+                        .await;
                     return;
                 }
             };
-            runtime.block_on(async move {
-                let mut orch = match SyncOrchestrator::new(cfg) {
-                    Ok(o) => o,
-                    Err(e) => {
-                        let _ = tx.send(SyncProgressEvent::Error(format!("init: {e}"))).await;
-                        let _ = tx
-                            .send(SyncProgressEvent::Complete(Default::default()))
-                            .await;
-                        return;
-                    }
-                };
-                let tx_inner = tx.clone();
-                let _ = orch
-                    .run_sync_with_progress(move |ev| {
-                        let _ = tx_inner.try_send(ev);
-                    })
-                    .await;
-            });
+            let tx_inner = tx.clone();
+            let _ = orch
+                .run_sync_with_progress(move |ev| {
+                    let _ = tx_inner.try_send(ev);
+                })
+                .await;
         });
+    });
 
-        let controls = controls_clone.clone();
-        let last_sync_label = last_sync_label.clone();
-        let browser_reload_cfg = browser_reload_cfg.clone();
-        glib::spawn_future_local(async move {
-            while let Ok(event) = rx.recv().await {
-                match event {
-                    SyncProgressEvent::Phase(phase) => {
-                        controls.status_label.set_text(phase_label(&phase));
-                    }
-                    SyncProgressEvent::TransferProgress(p) => {
-                        controls.update_progress(&p);
-                    }
-                    SyncProgressEvent::ConflictResolved(n) => {
-                        tracing::info!(
-                            "conflict: {} → {} wins ({})",
-                            n.document_name,
-                            n.winner_source,
-                            n.time_difference_human
-                        );
-                    }
-                    SyncProgressEvent::Error(msg) => {
-                        controls.show_error(&msg);
-                    }
-                    SyncProgressEvent::Complete(report) => {
+    glib::spawn_future_local(async move {
+        // Track whether any Error event fired so that a Complete with no
+        // progress doesn't overwrite the visible error message with a
+        // misleading "Sync complete: 0 pulled..." summary.
+        let mut saw_error = false;
+        while let Ok(event) = rx.recv().await {
+            match event {
+                SyncProgressEvent::Phase(phase) => {
+                    controls.status_label.set_text(phase_label(&phase));
+                }
+                SyncProgressEvent::TransferProgress(p) => {
+                    controls.update_progress(&p);
+                }
+                SyncProgressEvent::ConflictResolved(n) => {
+                    tracing::info!(
+                        "conflict: {} → {} wins ({})",
+                        n.document_name,
+                        n.winner_source,
+                        n.time_difference_human
+                    );
+                }
+                SyncProgressEvent::Error(msg) => {
+                    saw_error = true;
+                    controls.show_error(&msg);
+                }
+                SyncProgressEvent::Complete(report) => {
+                    if !report.errors.is_empty() {
+                        controls.show_error(&report.errors[0]);
+                    } else if saw_error {
+                        // leave the error UI as-is; the earlier Error event
+                        // already displayed a meaningful message.
+                    } else {
                         controls.finish_sync(&report.summary());
-                        last_sync_label
-                            .set_text(&crate::ui::sync_controls::format_last_sync_relative(
+                        last_sync_label.set_text(
+                            &crate::ui::sync_controls::format_last_sync_relative(
                                 Some(now_unix()),
                                 now_unix(),
-                            ));
-                        let cfg = browser_reload_cfg.borrow();
-                        let raw = cfg.sync.sync_dir.join("raw");
-                        drop(cfg);
-                        if let Ok(_tree) = DocumentTree::build_from_directory(&raw) {
-                            // In a real wire we would call browser.load_tree(&tree)
-                            // here; done via the outer main-thread closure because
-                            // FolderBrowser is not Send.
+                            ),
+                        );
+                        let raw = config.borrow().sync.sync_dir.join("raw");
+                        if let Ok(tree) = DocumentTree::build_from_directory(&raw) {
+                            browser.load_tree(&tree);
                         }
                     }
-                    SyncProgressEvent::ScanProgress(_) => {}
                 }
+                SyncProgressEvent::ScanProgress(_) => {}
             }
-        });
+        }
     });
 }
 
