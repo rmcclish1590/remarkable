@@ -335,11 +335,94 @@ fn svg_to_texture(svg_path: &Path) -> Result<gdk::MemoryTexture> {
 fn render_and_cache(rm_path: &Path, cache_path: &Path) -> Result<()> {
     let bytes = std::fs::read(rm_path)
         .with_context(|| format!("reading {}", rm_path.display()))?;
-    let page = parse_rm_file(&bytes).map_err(anyhow::Error::from)?;
-    let svg = render_page_to_svg(&page);
-    std::fs::write(cache_path, svg.as_bytes())
-        .with_context(|| format!("writing {}", cache_path.display()))?;
-    Ok(())
+    match parse_rm_file(&bytes) {
+        Ok(page) => {
+            let svg = render_page_to_svg(&page);
+            std::fs::write(cache_path, svg.as_bytes())
+                .with_context(|| format!("writing {}", cache_path.display()))?;
+            Ok(())
+        }
+        Err(e) => {
+            tracing::debug!("flat v6 parser failed ({e}), trying rmscene fallback");
+            render_via_rmscene(rm_path, cache_path)
+                .with_context(|| format!("rmscene fallback for {}", rm_path.display()))
+        }
+    }
+}
+
+fn render_via_rmscene(rm_path: &Path, cache_path: &Path) -> Result<()> {
+    let script = find_rm_to_svg_script()?;
+    let pythons = candidate_pythons();
+    let mut last_err = String::new();
+    for python in &pythons {
+        let result = std::process::Command::new(python)
+            .arg(&script)
+            .arg(rm_path)
+            .arg(cache_path)
+            .output();
+        match result {
+            Ok(output) if output.status.success() && cache_path.exists() => return Ok(()),
+            Ok(output) => {
+                last_err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            }
+            Err(e) => {
+                last_err = e.to_string();
+            }
+        }
+    }
+    anyhow::bail!(
+        "rm_to_svg.py failed with all Python candidates ({}): {last_err}",
+        pythons.join(", ")
+    )
+}
+
+fn candidate_pythons() -> Vec<String> {
+    let mut out = vec!["python3".to_string()];
+    if let Some(home) = dirs::home_dir() {
+        let venv = home.join(".local/share/rmsync/venv/bin/python3");
+        if venv.exists() {
+            out.insert(0, venv.to_string_lossy().into_owned());
+        }
+    }
+    // Check common venv locations
+    for path in &[
+        "/tmp/rmscene-env/bin/python3",
+    ] {
+        if Path::new(path).exists() {
+            out.push(path.to_string());
+        }
+    }
+    out
+}
+
+fn find_rm_to_svg_script() -> Result<std::path::PathBuf> {
+    // 1. Next to the rmsync binary
+    if let Ok(exe) = std::env::current_exe() {
+        let beside = exe.parent().unwrap_or(Path::new(".")).join("rm_to_svg.py");
+        if beside.exists() {
+            return Ok(beside);
+        }
+    }
+    // 2. In the source tree's scripts/ directory (dev mode)
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dev = manifest_dir.join("scripts").join("rm_to_svg.py");
+    if dev.exists() {
+        return Ok(dev);
+    }
+    // 3. In PATH
+    let which = std::process::Command::new("which")
+        .arg("rm_to_svg.py")
+        .output();
+    if let Ok(out) = which {
+        if out.status.success() {
+            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            return Ok(PathBuf::from(p));
+        }
+    }
+    anyhow::bail!(
+        "rm_to_svg.py not found. Install: pip install rmscene, then place \
+         scripts/rm_to_svg.py next to the rmsync binary or in PATH."
+    )
 }
 
 fn build_page_widget(svg_path: &Path, page_number: usize) -> gtk::Box {
