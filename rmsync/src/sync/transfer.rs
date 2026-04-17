@@ -249,16 +249,39 @@ where
 
         let result = pull_document(conn, &action.uuid, sync_dir).await?;
         if result.success {
-            if let Some(mut state) = db.get_state(&result.uuid)? {
-                state.local_hash = state.remote_hash.clone();
-                state.synced_hash = state.remote_hash.clone();
-                state.synced_mtime = state.remote_mtime;
-                state.sync_status = crate::sync::state_db::SyncStatus::Synced;
-                state.last_sync_at = Some(now_secs());
-                db.upsert_state(&state)?;
-            }
+            // Scan the freshly pulled files to get the real local hash.
+            let local_hash = scan_local_hash_for_uuid(
+                &action.uuid,
+                &sync_dir.join(crate::sync::scanner::RAW_SUBDIR),
+            );
+            let now = now_secs();
+            let state = match db.get_state(&result.uuid)? {
+                Some(mut existing) => {
+                    existing.local_hash = local_hash.clone();
+                    existing.synced_hash = local_hash;
+                    existing.sync_status = SyncStatus::Synced;
+                    existing.last_sync_at = Some(now);
+                    existing
+                }
+                None => SyncFileState {
+                    uuid: action.uuid.clone(),
+                    visible_name: action.visible_name.clone(),
+                    parent_uuid: String::new(),
+                    doc_type: "DocumentType".into(),
+                    local_hash: local_hash.clone(),
+                    remote_hash: local_hash.clone(),
+                    synced_hash: local_hash,
+                    local_mtime: Some(now),
+                    remote_mtime: Some(now),
+                    synced_mtime: Some(now),
+                    last_sync_at: Some(now),
+                    sync_status: SyncStatus::Synced,
+                    conflict_info: None,
+                },
+            };
+            db.upsert_state(&state)?;
         } else if let Some(mut state) = db.get_state(&result.uuid)? {
-            state.sync_status = crate::sync::state_db::SyncStatus::Error;
+            state.sync_status = SyncStatus::Error;
             db.upsert_state(&state)?;
         }
 
@@ -433,16 +456,38 @@ where
         });
         let result = push_document(conn, &action.uuid, sync_dir).await?;
         if result.success {
-            if let Some(mut state) = db.get_state(&result.uuid)? {
-                state.remote_hash = state.local_hash.clone();
-                state.synced_hash = state.local_hash.clone();
-                state.synced_mtime = state.local_mtime;
-                state.sync_status = crate::sync::state_db::SyncStatus::Synced;
-                state.last_sync_at = Some(now_secs());
-                db.upsert_state(&state)?;
-            }
+            let local_hash = scan_local_hash_for_uuid(
+                &action.uuid,
+                &sync_dir.join(crate::sync::scanner::RAW_SUBDIR),
+            );
+            let now = now_secs();
+            let state = match db.get_state(&result.uuid)? {
+                Some(mut existing) => {
+                    existing.remote_hash = local_hash.clone();
+                    existing.synced_hash = local_hash;
+                    existing.sync_status = SyncStatus::Synced;
+                    existing.last_sync_at = Some(now);
+                    existing
+                }
+                None => SyncFileState {
+                    uuid: action.uuid.clone(),
+                    visible_name: action.visible_name.clone(),
+                    parent_uuid: String::new(),
+                    doc_type: "DocumentType".into(),
+                    local_hash: local_hash.clone(),
+                    remote_hash: local_hash.clone(),
+                    synced_hash: local_hash,
+                    local_mtime: Some(now),
+                    remote_mtime: Some(now),
+                    synced_mtime: Some(now),
+                    last_sync_at: Some(now),
+                    sync_status: SyncStatus::Synced,
+                    conflict_info: None,
+                },
+            };
+            db.upsert_state(&state)?;
         } else if let Some(mut state) = db.get_state(&result.uuid)? {
-            state.sync_status = crate::sync::state_db::SyncStatus::Error;
+            state.sync_status = SyncStatus::Error;
             db.upsert_state(&state)?;
         }
         bytes_done += result.bytes_transferred;
@@ -490,6 +535,54 @@ pub async fn reload_xochitl(conn: &mut DeviceConnection) -> Result<()> {
         tracing::warn!("systemctl restart xochitl exited with {status}");
     }
     Ok(())
+}
+
+/// Compute a local content hash for a single UUID after pull/push. Falls
+/// back to an empty string if the files can't be read — the next sync will
+/// detect the mismatch and re-classify.
+fn scan_local_hash_for_uuid(uuid: &str, raw: &Path) -> Option<String> {
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(raw) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&format!("{uuid}.")) {
+                if let Ok(info) = local_file_info(&entry.path(), &name) {
+                    files.push(info);
+                }
+            }
+        }
+    }
+    let subdir = raw.join(uuid);
+    if subdir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&subdir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if let Ok(info) = local_file_info(&entry.path(), &name) {
+                    files.push(info);
+                }
+            }
+        }
+    }
+    crate::sync::scanner::compute_local_hash(uuid, &files, raw).ok()
+}
+
+fn local_file_info(
+    path: &Path,
+    name: &str,
+) -> Result<crate::sync::scanner::LocalFileInfo> {
+    let md = std::fs::metadata(path)?;
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Ok(crate::sync::scanner::LocalFileInfo {
+        path: path.to_path_buf(),
+        name: name.to_string(),
+        size: md.len(),
+        mtime,
+    })
 }
 
 fn now_secs() -> u64 {
