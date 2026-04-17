@@ -309,18 +309,29 @@ impl Default for DocumentViewer {
     }
 }
 
+/// Default render width in pixels. The reMarkable's native viewport is
+/// 1404×1872; rendering at 800px keeps pages crisp while using ~2.5 MB
+/// per page instead of ~10 MB at full resolution.
+const DEFAULT_RENDER_WIDTH: u32 = 800;
+
 fn svg_to_texture(svg_path: &Path) -> Result<gdk::MemoryTexture> {
+    svg_to_texture_scaled(svg_path, DEFAULT_RENDER_WIDTH)
+}
+
+fn svg_to_texture_scaled(svg_path: &Path, target_width: u32) -> Result<gdk::MemoryTexture> {
     let svg_bytes = std::fs::read(svg_path)
         .with_context(|| format!("reading {}", svg_path.display()))?;
     let options = resvg::usvg::Options::default();
     let tree = resvg::usvg::Tree::from_data(&svg_bytes, &options)
         .with_context(|| "parsing SVG")?;
     let size = tree.size();
-    let width = size.width() as u32;
-    let height = size.height() as u32;
+    let scale = target_width as f32 / size.width();
+    let width = target_width;
+    let height = (size.height() * scale) as u32;
     let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
         .ok_or_else(|| anyhow::anyhow!("pixmap allocation failed ({width}x{height})"))?;
-    resvg::render(&tree, resvg::tiny_skia::Transform::default(), &mut pixmap.as_mut());
+    let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
     let bytes = glib::Bytes::from(pixmap.data());
     let texture = gdk::MemoryTexture::new(
         width as i32,
@@ -429,17 +440,20 @@ fn build_page_widget(svg_path: &Path, page_number: usize) -> gtk::Box {
     let picture = match svg_to_texture(svg_path) {
         Ok(texture) => {
             let p = gtk::Picture::for_paintable(&texture);
-            p.set_content_fit(gtk::ContentFit::Contain);
+            p.set_content_fit(gtk::ContentFit::Fill);
             p.set_can_shrink(true);
             p.set_hexpand(true);
+            p.set_vexpand(false);
+            // Set the height request to match the rendered texture's
+            // aspect ratio at the current width allocation. The texture
+            // is already scaled to DEFAULT_RENDER_WIDTH, so use its
+            // actual pixel height as the request — this ensures each
+            // page takes exactly the right vertical space.
+            p.set_height_request(texture.height());
             p
         }
         Err(e) => {
             tracing::warn!("page {page_number}: SVG render failed: {e}");
-            let label = gtk::Label::new(Some(&format!(
-                "Page {page_number}: render failed — {e}"
-            )));
-            label.add_css_class("dim-label");
             let p = gtk::Picture::new();
             p.set_hexpand(true);
             p.set_height_request(200);
