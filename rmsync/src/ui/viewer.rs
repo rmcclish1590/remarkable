@@ -20,6 +20,7 @@ use gtk::prelude::*;
 use crate::remarkable::metadata::RemarkableContent;
 use crate::remarkable::rm_parser::parse_rm_file;
 use crate::remarkable::svg_renderer::render_page_to_svg;
+use crate::sync::transfer::{is_safe_component, is_safe_uuid};
 
 const REMARKABLE_PAGE_WIDTH: i32 = 1404;
 const REMARKABLE_PAGE_HEIGHT: i32 = 1872;
@@ -168,6 +169,11 @@ impl DocumentViewer {
     pub fn load_document(&self, uuid: &str, sync_dir: &Path) -> Result<()> {
         self.clear_pages_box();
 
+        if !is_safe_uuid(uuid) {
+            self.show_error("Invalid document", "This document's identifier is invalid.");
+            return Ok(());
+        }
+
         let raw = sync_dir.join("raw");
         let cache = sync_dir.join(".rmsync").join("cache");
         std::fs::create_dir_all(&cache)
@@ -189,12 +195,28 @@ impl DocumentViewer {
         let mut page_widgets = Vec::new();
         let mut failures: Vec<String> = Vec::new();
         for (i, page_id) in page_ids.iter().enumerate() {
+            // page_id comes from the tablet-supplied .content JSON — a
+            // compromised/malicious tablet could embed path-traversal
+            // sequences here, so it must be validated as a single safe path
+            // component before it's used to build any filesystem path.
+            if !is_safe_component(page_id) {
+                failures.push(format!("page {}: invalid page id in document metadata", i + 1));
+                continue;
+            }
             let rm_path = raw.join(uuid).join(format!("{page_id}.rm"));
+            if !rm_path.starts_with(&raw) {
+                failures.push(format!("page {}: rejected unsafe page path", i + 1));
+                continue;
+            }
             if !rm_path.exists() {
                 failures.push(format!("page {}: .rm file not found", i + 1));
                 continue;
             }
             let cache_path = cache.join(format!("{uuid}_{page_id}.svg"));
+            if !cache_path.starts_with(&cache) {
+                failures.push(format!("page {}: rejected unsafe cache path", i + 1));
+                continue;
+            }
             if !cache_path.exists() {
                 match render_and_cache(&rm_path, &cache_path) {
                     Ok(()) => {}
@@ -388,19 +410,16 @@ fn render_via_rmscene(rm_path: &Path, cache_path: &Path) -> Result<()> {
 }
 
 fn candidate_pythons() -> Vec<String> {
+    // Only ever resolve interpreters from locations the current user owns
+    // (their XDG data dir) or from PATH. A shared, world-writable path like
+    // /tmp must never be trusted here: any local user could plant a binary
+    // there and have it executed with rmsync's privileges the next time a
+    // document triggers the rmscene fallback.
     let mut out = vec!["python3".to_string()];
     if let Some(home) = dirs::home_dir() {
         let venv = home.join(".local/share/rmsync/venv/bin/python3");
         if venv.exists() {
             out.insert(0, venv.to_string_lossy().into_owned());
-        }
-    }
-    // Check common venv locations
-    for path in &[
-        "/tmp/rmscene-env/bin/python3",
-    ] {
-        if Path::new(path).exists() {
-            out.push(path.to_string());
         }
     }
     out
@@ -519,6 +538,49 @@ mod tests {
     #[test]
     fn aspect_ratio_is_remarkable_native() {
         assert_eq!(REMARKABLE_PAGE_ASPECT, (1404, 1872));
+    }
+
+    // Regression tests for the path-traversal fix: page_id and uuid values
+    // come from tablet-supplied JSON and must be rejected before they're
+    // used to build filesystem paths. DocumentViewer itself needs a live
+    // GTK display to construct, so these exercise the same validation
+    // helpers load_document guards its path-building with.
+    #[test]
+    fn malicious_page_id_is_rejected_as_unsafe_component() {
+        for bad in [
+            "../../../../etc/passwd",
+            "..",
+            "a/../../b",
+            "a/b",
+            ".hidden",
+            "evil\0name",
+        ] {
+            assert!(!is_safe_component(bad), "expected {bad:?} to be rejected");
+        }
+    }
+
+    #[test]
+    fn legitimate_page_id_is_accepted_as_safe_component() {
+        assert!(is_safe_component("a1b2c3d4-e5f6-7890-abcd-ef1234567890"));
+    }
+
+    #[test]
+    fn malicious_uuid_is_rejected() {
+        assert!(!is_safe_uuid("../../../etc/passwd"));
+        assert!(!is_safe_uuid("abc/def"));
+    }
+
+    #[test]
+    fn candidate_pythons_never_trusts_a_shared_tmp_path() {
+        // Regression test: /tmp is world-writable, so any local user could
+        // plant a binary there and have it executed with rmsync's
+        // privileges via the rmscene fallback.
+        for candidate in candidate_pythons() {
+            assert!(
+                !candidate.starts_with("/tmp"),
+                "candidate python interpreter must not come from /tmp: {candidate}"
+            );
+        }
     }
 
     #[test]

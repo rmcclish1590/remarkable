@@ -134,7 +134,11 @@ async fn list_remote_files_for_uuid(
 
 /// Validate a uuid-like identifier: hex digits and `-` only, length-bounded.
 /// Rejects anything that could escape a path component or pollute globs.
-fn is_safe_uuid(uuid: &str) -> bool {
+///
+/// `pub(crate)` so other modules that build filesystem paths from
+/// tablet-supplied identifiers (e.g. the document viewer's page IDs) can
+/// reuse this validation instead of trusting the device.
+pub(crate) fn is_safe_uuid(uuid: &str) -> bool {
     !uuid.is_empty()
         && uuid.len() <= 64
         && uuid.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
@@ -143,7 +147,7 @@ fn is_safe_uuid(uuid: &str) -> bool {
 /// Validate that a single path component (name between `/`s) is safe to use
 /// as a filesystem path component. Rejects `.`, `..`, empty, `/` embedded,
 /// NUL bytes, and leading dots (so adversarial dotfiles can't appear).
-fn is_safe_component(name: &str) -> bool {
+pub(crate) fn is_safe_component(name: &str) -> bool {
     !name.is_empty()
         && name != "."
         && name != ".."

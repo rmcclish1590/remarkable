@@ -391,6 +391,7 @@ fn map_connect_err(e: russh::Error, cfg: &ConnectionConfig) -> ConnectionError {
             ConnectionError::Timeout(cfg.timeout_secs)
         }
         russh::Error::IO(io) => ConnectionError::Io(io),
+        russh::Error::UnknownKey => ConnectionError::HostKeyMismatch,
         other => ConnectionError::SshError(other.to_string()),
     }
 }
@@ -477,43 +478,30 @@ impl Handler for ClientHandler {
         );
         match std::fs::read_to_string(&self.known_hosts_path) {
             Ok(existing) => {
-                // Accept any line in the file that matches this fingerprint.
-                // File may contain entries from multiple host-key algorithms
-                // (ssh-ed25519, ssh-rsa, ecdsa-*) — the tablet advertises a
-                // few and russh can negotiate any of them depending on the
-                // client's algorithm preference ordering.
-                let mut found = false;
-                let mut has_any = false;
-                for line in existing.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with('#') {
-                        continue;
+                // A host may legitimately present several key *algorithms*
+                // (ssh-ed25519, ssh-rsa, ecdsa-*), so we pin one fingerprint
+                // per algorithm rather than a single fingerprint per host.
+                // But if we already have a pinned fingerprint for THIS
+                // algorithm and the server now presents a different one,
+                // that is a genuine key change — possibly a MITM — and must
+                // be rejected, not silently re-pinned.
+                match find_pinned_fingerprint(&existing, algo) {
+                    Some(stored) if stored == fingerprint => {
+                        self.matched_existing = true;
+                        Ok(true)
                     }
-                    has_any = true;
-                    // Allow entries formatted as either bare "<b64>" or
-                    // "<algorithm> <b64>".
-                    let stored = line.split_whitespace().next_back().unwrap_or(line);
-                    if stored == fingerprint {
-                        found = true;
-                        break;
+                    Some(stored) => {
+                        tracing::error!(
+                            "host key mismatch for algo {algo}: pinned {stored}, server presented {fingerprint} — refusing to connect"
+                        );
+                        Ok(false)
                     }
-                }
-                if found {
-                    self.matched_existing = true;
-                    Ok(true)
-                } else if !has_any {
-                    write_fingerprint(&self.known_hosts_path, algo, &fingerprint)?;
-                    Ok(true)
-                } else {
-                    // Unknown key for a known host: append rather than reject
-                    // so a server presenting a new key type on a negotiated
-                    // algorithm doesn't wedge us. Log loudly for audit.
-                    tracing::warn!(
-                        "pinning new host-key entry: {algo} {fingerprint} (append to {})",
-                        self.known_hosts_path.display()
-                    );
-                    append_fingerprint(&self.known_hosts_path, algo, &fingerprint)?;
-                    Ok(true)
+                    None => {
+                        // First time we've seen this algorithm for this
+                        // host: pin it.
+                        append_fingerprint(&self.known_hosts_path, algo, &fingerprint)?;
+                        Ok(true)
+                    }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -523,6 +511,31 @@ impl Handler for ClientHandler {
             Err(e) => Err(russh::Error::IO(e)),
         }
     }
+}
+
+/// Look up the pinned fingerprint for a given host-key algorithm in the
+/// contents of a known_hosts-style file. Lines are `"<algorithm>
+/// <fingerprint>"`; a legacy bare `"<fingerprint>"` line (no algorithm
+/// recorded) is treated as belonging to whatever algorithm is being looked
+/// up, so pre-existing known_hosts files keep working.
+fn find_pinned_fingerprint(existing: &str, algo: &str) -> Option<String> {
+    for line in existing.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let first = parts.next().unwrap_or("");
+        let second = parts.next();
+        let (line_algo, line_fp) = match second {
+            Some(fp) => (first, fp),
+            None => (algo, first),
+        };
+        if line_algo == algo {
+            return Some(line_fp.to_string());
+        }
+    }
+    None
 }
 
 fn write_fingerprint(
@@ -655,5 +668,68 @@ mod tests {
         let pem = encode_ed25519_openssh(&kp).expect("encode");
         assert!(pem.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"));
         assert!(pem.trim_end().ends_with("-----END OPENSSH PRIVATE KEY-----"));
+    }
+
+    #[test]
+    fn find_pinned_fingerprint_matches_algo_specific_entry() {
+        let file = "ssh-ed25519 aaa\nssh-rsa bbb\n";
+        assert_eq!(
+            find_pinned_fingerprint(file, "ssh-ed25519"),
+            Some("aaa".to_string())
+        );
+        assert_eq!(
+            find_pinned_fingerprint(file, "ssh-rsa"),
+            Some("bbb".to_string())
+        );
+    }
+
+    #[test]
+    fn find_pinned_fingerprint_returns_none_for_unseen_algo() {
+        let file = "ssh-ed25519 aaa\n";
+        assert_eq!(find_pinned_fingerprint(file, "ecdsa-sha2-nistp256"), None);
+    }
+
+    #[test]
+    fn find_pinned_fingerprint_returns_none_for_empty_file() {
+        assert_eq!(find_pinned_fingerprint("", "ssh-ed25519"), None);
+    }
+
+    #[test]
+    fn find_pinned_fingerprint_handles_legacy_bare_lines() {
+        // Old known_hosts files (pre this fix) may contain bare fingerprint
+        // lines with no algorithm prefix.
+        let file = "aaa\n";
+        assert_eq!(
+            find_pinned_fingerprint(file, "ssh-ed25519"),
+            Some("aaa".to_string())
+        );
+    }
+
+    #[test]
+    fn find_pinned_fingerprint_ignores_comments_and_blank_lines() {
+        let file = "# comment\n\nssh-ed25519 aaa\n";
+        assert_eq!(
+            find_pinned_fingerprint(file, "ssh-ed25519"),
+            Some("aaa".to_string())
+        );
+    }
+
+    #[test]
+    fn find_pinned_fingerprint_detects_changed_key_for_same_algo() {
+        // Regression test for the MITM-bypass fix: a stored fingerprint for
+        // an algorithm we've already pinned must be surfaced as a distinct
+        // value from whatever the server now presents, so the caller can
+        // reject rather than silently re-pin.
+        let file = "ssh-ed25519 old-fingerprint\n";
+        let stored = find_pinned_fingerprint(file, "ssh-ed25519").unwrap();
+        assert_ne!(stored, "new-fingerprint");
+        assert_eq!(stored, "old-fingerprint");
+    }
+
+    #[test]
+    fn map_connect_err_maps_unknown_key_to_host_key_mismatch() {
+        let cfg = ConnectionConfig::default();
+        let mapped = map_connect_err(russh::Error::UnknownKey, &cfg);
+        assert!(matches!(mapped, ConnectionError::HostKeyMismatch));
     }
 }

@@ -245,11 +245,26 @@ fn run_setup_key_auth<F: Fn() + 'static>(
                 on_ready();
             }
             Ok(Err(msg)) => {
-                show_error_dialog_with_heading(
-                    &window,
-                    "SSH setup failed",
-                    &format!("{msg}\n\nTip: if this mentions \"Unknown server key\", try deleting ~/.config/rmsync/known_hosts and retrying."),
-                );
+                if msg.contains("Host key mismatch") {
+                    // Do NOT suggest deleting known_hosts as a routine fix —
+                    // that file is exactly what protects against a
+                    // man-in-the-middle presenting a different key. Only a
+                    // deliberate, informed choice (e.g. the tablet was
+                    // factory-reset or re-flashed) should ever clear it.
+                    show_error_dialog_with_heading(
+                        &window,
+                        "Device identity changed",
+                        "The reMarkable presented a different SSH host key than the one \
+                         previously recorded for it. This normally means the tablet was \
+                         reset or reinstalled — but it can also mean another device on the \
+                         network is intercepting the connection.\n\n\
+                         Only continue if you are sure this is your own tablet after a \
+                         reset. To do so, remove its entry from \
+                         ~/.config/rmsync/known_hosts yourself, then retry.",
+                    );
+                } else {
+                    show_error_dialog_with_heading(&window, "SSH setup failed", &msg);
+                }
             }
             Err(_) => {
                 show_error_dialog_with_heading(
