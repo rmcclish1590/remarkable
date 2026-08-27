@@ -18,5 +18,6 @@ fn minimal_rm_file_parses_and_renders_to_valid_svg() {
 
     assert!(svg.starts_with("<svg"));
     assert!(svg.ends_with("</svg>"));
-    assert!(svg.contains(r#"viewBox="0 0 1404 1872""#));
+    // Empty page (0 layers) uses the default 1404×1872 viewport.
+    assert!(svg.contains("viewBox=\"0.0 0.0 1404.0 1872.0\""));
 }

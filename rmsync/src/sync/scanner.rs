@@ -180,16 +180,27 @@ fn files_for_uuid(entries: &[RemoteFileInfo], uuid: &str) -> Vec<RemoteFileInfo>
         .collect()
 }
 
+/// Relativise a remote path so it hashes identically to the local scanner's
+/// relative paths. `/home/root/.../xochitl/uuid.metadata` → `uuid.metadata`.
+fn remote_path_to_relative(path: &str) -> &str {
+    let prefix = format!("{}/", XOCHITL_PATH);
+    path.strip_prefix(&prefix)
+        .or_else(|| path.strip_prefix(XOCHITL_PATH))
+        .unwrap_or(path)
+}
+
 async fn compute_remote_hash(
     conn: &DeviceConnection,
     file_list: &[RemoteFileInfo],
 ) -> Result<String> {
     let mut sorted: Vec<&RemoteFileInfo> = file_list.iter().collect();
-    sorted.sort_by(|a, b| a.path.cmp(&b.path));
+    sorted.sort_by(|a, b| {
+        remote_path_to_relative(&a.path).cmp(remote_path_to_relative(&b.path))
+    });
 
     let mut hasher = Sha256::new();
     for f in sorted {
-        hasher.update(f.path.as_bytes());
+        hasher.update(remote_path_to_relative(&f.path).as_bytes());
         hasher.update([0u8]);
         if f.is_dir {
             continue;
@@ -551,6 +562,19 @@ mod tests {
     #[test]
     fn xochitl_path_constant() {
         assert!(XOCHITL_PATH.ends_with("/xochitl"));
+    }
+
+    #[test]
+    fn remote_path_to_relative_strips_xochitl_prefix() {
+        assert_eq!(
+            remote_path_to_relative(&format!("{XOCHITL_PATH}/abc.metadata")),
+            "abc.metadata"
+        );
+        assert_eq!(
+            remote_path_to_relative(&format!("{XOCHITL_PATH}/abc/p1.rm")),
+            "abc/p1.rm"
+        );
+        assert_eq!(remote_path_to_relative("other/path"), "other/path");
     }
 
     // --- local scanner (spec 09) ---

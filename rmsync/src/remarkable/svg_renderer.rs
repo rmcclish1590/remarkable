@@ -1,9 +1,9 @@
 //! Convert parsed `RmPage` stroke data into SVG documents.
 //!
-//! All output uses a fixed 1404×1872 viewport (the reMarkable's native
-//! resolution) so pages render at consistent size regardless of stroke
-//! density. Eraser strokes are dropped — their effect is already baked
-//! into the surviving stroke set on the device.
+//! The viewBox is computed from the actual bounding box of all strokes
+//! (with padding) so content that extends beyond the reMarkable's default
+//! 1404×1872 viewport — or uses negative coordinates from panning — is
+//! always fully visible. Eraser strokes are dropped.
 
 use crate::remarkable::rm_parser::{PenColor, PenType, RmPage, RmStroke};
 use anyhow::{Context, Result};
@@ -11,20 +11,45 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const VIEW_W: u32 = 1404;
-const VIEW_H: u32 = 1872;
+const DEFAULT_W: f32 = 1404.0;
+const DEFAULT_H: f32 = 1872.0;
 const HIGHLIGHTER_OPACITY: f32 = 0.3;
+const PADDING: f32 = 20.0;
 
 pub fn render_page_to_svg(page: &RmPage) -> String {
+    let (min_x, min_y, max_x, max_y) = page.bounding_box();
+    let has_strokes = page.total_strokes() > 0;
+
+    // Use the bounding box of all strokes (padded), falling back to
+    // the default reMarkable viewport for blank pages.
+    let (vb_x, vb_y, vb_w, vb_h) = if has_strokes {
+        let x = min_x - PADDING;
+        let y = min_y - PADDING;
+        let w = (max_x - min_x) + 2.0 * PADDING;
+        let h = (max_y - min_y) + 2.0 * PADDING;
+        // Ensure minimum viewport matches the device page when content
+        // fits within it, so blank margins look natural.
+        (
+            x.min(0.0),
+            y.min(0.0),
+            w.max(DEFAULT_W - x.min(0.0)),
+            h.max(DEFAULT_H - y.min(0.0)),
+        )
+    } else {
+        (0.0, 0.0, DEFAULT_W, DEFAULT_H)
+    };
+
     let mut out = String::with_capacity(2048);
     write!(
         out,
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {VIEW_W} {VIEW_H}" width="{VIEW_W}" height="{VIEW_H}">"#
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="{vb_x:.1} {vb_y:.1} {vb_w:.1} {vb_h:.1}" width="{w}" height="{h}">"#,
+        w = vb_w as u32,
+        h = vb_h as u32,
     )
     .unwrap();
     write!(
         out,
-        r#"<rect width="{VIEW_W}" height="{VIEW_H}" fill="white"/>"#
+        r#"<rect x="{vb_x:.1}" y="{vb_y:.1}" width="{vb_w:.1}" height="{vb_h:.1}" fill="white"/>"#
     )
     .unwrap();
 
@@ -184,8 +209,9 @@ mod tests {
     fn empty_page_renders_background_only() {
         let page = page_with(vec![]);
         let svg = render_page_to_svg(&page);
-        assert!(svg.contains(r#"viewBox="0 0 1404 1872""#));
-        assert!(svg.contains(r#"<rect width="1404" height="1872" fill="white"/>"#));
+        // Empty page falls back to the default 1404×1872 viewport.
+        assert!(svg.contains("viewBox=\"0.0 0.0 1404.0 1872.0\""));
+        assert!(svg.contains("fill=\"white\""));
         assert!(!svg.contains("<g "));
         assert!(!svg.contains("<polyline"));
         assert!(svg.ends_with("</svg>"));
@@ -322,7 +348,8 @@ mod tests {
         render_page_to_svg_file(&page, &path).unwrap();
         let written = fs::read_to_string(&path).unwrap();
         assert!(written.starts_with("<svg "));
-        assert!(written.contains(r#"viewBox="0 0 1404 1872""#));
+        assert!(written.contains("viewBox=\""));
+        assert!(written.contains("fill=\"white\""));
         assert!(written.ends_with("</svg>"));
     }
 
