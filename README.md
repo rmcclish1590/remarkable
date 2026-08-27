@@ -23,13 +23,21 @@ Remarkable connects to your reMarkable tablet to provide two-way data synchroniz
 ### Option A — Install the .deb package (recommended)
 
 1. Build the package (see [Building the .deb package](#building-the-deb-package) below), or use a prebuilt `rmsync_<version>_amd64.deb` if you have one.
-2. Install it:
+2. Install it with the install script, which stages the package where apt's sandboxed `_apt` user can read it:
 
    ```bash
-   sudo apt install ./rmsync_0.1.0-1_amd64.deb
+   cd rmsync
+   ./scripts/install-deb.sh                # installs the newest package from target/debian/
    ```
 
-   This installs the `rmsync` binary to `/usr/bin`, adds an application menu entry with icon, and installs a udev rule for tablet detection.
+   Or install a specific package file manually. If the `.deb` lives under your home directory, copy it to `/tmp` first — otherwise apt prints `N: Download unsandboxed as root ... Permission denied` because the sandboxed `_apt` user cannot read files under a private home directory:
+
+   ```bash
+   cp rmsync_0.1.0-1_amd64.deb /tmp/
+   sudo apt install /tmp/rmsync_0.1.0-1_amd64.deb
+   ```
+
+   Installation adds the `rmsync` binary to `/usr/bin`, an application menu entry with icon, and a udev rule for tablet detection.
 
 3. Verify the installation:
 
