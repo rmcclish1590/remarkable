@@ -88,10 +88,6 @@ pub fn apply_sync_dir(config: &Rc<RefCell<AppConfig>>, path: &Path) -> anyhow::R
     Ok(())
 }
 
-fn show_error_dialog(window: &adw::ApplicationWindow, message: &str) {
-    show_error_dialog_with_heading(window, "Something went wrong", message);
-}
-
 fn show_error_dialog_with_heading(
     window: &adw::ApplicationWindow,
     heading: &str,
