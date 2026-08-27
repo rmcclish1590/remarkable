@@ -37,7 +37,6 @@ pub struct DocumentViewer {
     pub widget: gtk::Box,
     scroll: gtk::ScrolledWindow,
     pages_box: gtk::Box,
-    error_box: gtk::Box,
     error_heading: gtk::Label,
     error_detail: gtk::Label,
     stack: gtk::Stack,
@@ -146,7 +145,6 @@ impl DocumentViewer {
             widget,
             scroll,
             pages_box,
-            error_box,
             error_heading,
             error_detail,
             stack,
@@ -253,7 +251,7 @@ impl DocumentViewer {
 
         if !failures.is_empty() {
             let warning = gtk::Label::builder()
-                .label(&format!(
+                .label(format!(
                     "⚠ {rendered} of {total} pages rendered — {} failed:\n{}",
                     failures.len(),
                     failures.join("\n")
