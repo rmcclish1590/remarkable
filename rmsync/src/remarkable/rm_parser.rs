@@ -1,14 +1,22 @@
-//! Parser for the reMarkable `.rm` v6 binary stroke format.
+//! Parser for the reMarkable `.rm` binary stroke formats.
 //!
-//! The format is little-endian, uncompressed. Layout:
-//! - 43-byte ASCII header: `"reMarkable .lines file, version=6"` padded with spaces.
-//! - 10 bytes of additional padding.
-//! - `i32` layer count, then for each layer:
-//!   - `i32` stroke count, then for each stroke:
-//!     - `i32` pen, `i32` color, `i32` (skip), `f32` base width,
-//!       `i32` (skip), `i32` point count, then for each point:
-//!       - 6 × `f32`: x, y, speed, direction, width, pressure.
+//! Every version opens with the same 43-byte ASCII header
+//! (`"reMarkable .lines file, version=N"` padded with spaces), but the
+//! body differs completely between generations, so the version selects
+//! the decoder:
+//!
+//! - **v6** (firmware 3.x and later) is a CRDT scene tree written as a
+//!   sequence of length-prefixed blocks. Decoded by [`crate::remarkable::rm_v6`].
+//! - **v3/v5** use the older flat layout handled here:
+//!   - `i32` layer count, then for each layer:
+//!     - `i32` stroke count, then for each stroke:
+//!       - `i32` pen, `i32` color, `i32` (skip), `f32` base width,
+//!         `i32` (skip), `i32` point count, then for each point:
+//!         - 6 × `f32`: x, y, speed, direction, width, pressure.
+//!
+//! All formats are little-endian and uncompressed.
 
+use super::rm_v6::parse_v6_blocks;
 use nom::multi::count;
 use nom::number::complete::{le_f32, le_i32};
 use nom::IResult;
@@ -19,7 +27,9 @@ use thiserror::Error;
 const HEADER_LEN: usize = 43;
 const HEADER_PREFIX: &str = "reMarkable .lines file, version=";
 const POST_HEADER_PAD: usize = 10;
-const EXPECTED_VERSION: u32 = 6;
+const V6_VERSION: u32 = 6;
+/// Versions handled by the flat layout below.
+const FLAT_VERSIONS: [u32; 2] = [3, 5];
 
 #[derive(Debug, Clone)]
 pub struct RmPage {
@@ -83,7 +93,7 @@ pub enum PenColor {
 pub enum RmParseError {
     #[error("Invalid header: expected reMarkable .lines file")]
     InvalidHeader,
-    #[error("Unsupported version: {0} (expected 6)")]
+    #[error("Unsupported version: {0} (expected 3, 5 or 6)")]
     UnsupportedVersion(u32),
     #[error("Unexpected end of file at offset {0}")]
     UnexpectedEof(usize),
@@ -94,15 +104,47 @@ pub enum RmParseError {
 }
 
 pub fn parse_rm_file(input: &[u8]) -> Result<RmPage, RmParseError> {
-    let (rest, version) = parse_header(input)?;
-    if version != EXPECTED_VERSION {
+    let version = parse_header(input)?;
+
+    if version == V6_VERSION {
+        // v6 blocks begin immediately after the header, with no padding.
+        let layers = parse_v6_blocks(&input[HEADER_LEN..]);
+        return Ok(RmPage { version, layers });
+    }
+
+    if !FLAT_VERSIONS.contains(&version) {
         return Err(RmParseError::UnsupportedVersion(version));
     }
 
-    let offset_after_header = input.len() - rest.len();
+    // The layer count normally follows the header directly, but some
+    // writers insert padding first. Reading at the wrong offset usually
+    // still "succeeds" with a nonsense layer count rather than erroring,
+    // so decode both ways and keep whichever actually recovered strokes.
+    let unpadded = parse_flat_body(input, version, HEADER_LEN);
+    let padded = parse_flat_body(input, version, HEADER_LEN + POST_HEADER_PAD);
+    match (unpadded, padded) {
+        (Ok(a), Ok(b)) => Ok(if b.total_strokes() > a.total_strokes() {
+            b
+        } else {
+            a
+        }),
+        (Ok(page), Err(_)) | (Err(_), Ok(page)) => Ok(page),
+        (Err(e), Err(_)) => Err(e),
+    }
+}
+
+fn parse_flat_body(
+    input: &[u8],
+    version: u32,
+    body_start: usize,
+) -> Result<RmPage, RmParseError> {
+    let rest = input
+        .get(body_start..)
+        .ok_or(RmParseError::UnexpectedEof(body_start))?;
+
     let (rest, num_layers) = le_i32::<_, nom::error::Error<&[u8]>>(rest)
-        .map_err(|_| RmParseError::UnexpectedEof(offset_after_header))?;
-    let num_layers = checked_count(num_layers, "layer count", offset_after_header)?;
+        .map_err(|_| RmParseError::UnexpectedEof(body_start))?;
+    let num_layers = checked_count(num_layers, "layer count", body_start)?;
 
     let offset_at_layers = input.len() - rest.len();
     let (_, layers) = count(parse_layer, num_layers)(rest)
@@ -166,8 +208,8 @@ impl RmPage {
     }
 }
 
-fn parse_header(input: &[u8]) -> Result<(&[u8], u32), RmParseError> {
-    if input.len() < HEADER_LEN + POST_HEADER_PAD {
+fn parse_header(input: &[u8]) -> Result<u32, RmParseError> {
+    if input.len() < HEADER_LEN {
         return Err(RmParseError::UnexpectedEof(0));
     }
     let header_bytes = &input[..HEADER_LEN];
@@ -184,7 +226,7 @@ fn parse_header(input: &[u8]) -> Result<(&[u8], u32), RmParseError> {
         return Err(RmParseError::InvalidHeader);
     }
     let version: u32 = version_digits.parse().map_err(|_| RmParseError::InvalidHeader)?;
-    Ok((&input[HEADER_LEN + POST_HEADER_PAD..], version))
+    Ok(version)
 }
 
 fn parse_layer(input: &[u8]) -> IResult<&[u8], RmLayer> {
@@ -244,7 +286,7 @@ fn checked_count(raw: i32, label: &str, offset: usize) -> Result<usize, RmParseE
     }
 }
 
-fn pen_from_raw(n: u32) -> PenType {
+pub(super) fn pen_from_raw(n: u32) -> PenType {
     match n {
         0 | 1 | 12 | 14 => PenType::BallPoint,
         2 | 4 | 15 | 17 => PenType::Fineliner,
@@ -260,7 +302,7 @@ fn pen_from_raw(n: u32) -> PenType {
     }
 }
 
-fn color_from_raw(n: u32) -> PenColor {
+pub(super) fn color_from_raw(n: u32) -> PenColor {
     match n {
         0 => PenColor::Black,
         1 => PenColor::Grey,
@@ -316,7 +358,7 @@ mod tests {
 
     #[test]
     fn parses_minimal_valid_blob() {
-        let blob = BlobBuilder::new(6)
+        let blob = BlobBuilder::new(5)
             .i32(1) // 1 layer
             .i32(1) // 1 stroke
             .stroke(
@@ -331,7 +373,7 @@ mod tests {
             )
             .done();
         let page = parse_rm_file(&blob).unwrap();
-        assert_eq!(page.version, 6);
+        assert_eq!(page.version, 5);
         assert_eq!(page.layers.len(), 1);
         assert_eq!(page.layers[0].strokes.len(), 1);
         let s = &page.layers[0].strokes[0];
@@ -353,9 +395,9 @@ mod tests {
 
     #[test]
     fn empty_page_parses_to_zero_layers() {
-        let blob = BlobBuilder::new(6).i32(0).done();
+        let blob = BlobBuilder::new(5).i32(0).done();
         let page = parse_rm_file(&blob).unwrap();
-        assert_eq!(page.version, 6);
+        assert_eq!(page.version, 5);
         assert!(page.layers.is_empty());
         assert!(page.is_empty());
         assert_eq!(page.total_strokes(), 0);
@@ -365,7 +407,7 @@ mod tests {
 
     #[test]
     fn multiple_layers_and_strokes() {
-        let blob = BlobBuilder::new(6)
+        let blob = BlobBuilder::new(5)
             .i32(2) // 2 layers
             // layer 0: 2 strokes
             .i32(2)
@@ -397,12 +439,68 @@ mod tests {
 
     #[test]
     fn wrong_version_errors() {
-        let blob = BlobBuilder::new(5).i32(0).done();
+        let blob = BlobBuilder::new(4).i32(0).done();
         let err = parse_rm_file(&blob).unwrap_err();
         match err {
-            RmParseError::UnsupportedVersion(v) => assert_eq!(v, 5),
+            RmParseError::UnsupportedVersion(v) => assert_eq!(v, 4),
             other => panic!("expected UnsupportedVersion, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn v3_uses_the_flat_layout() {
+        let blob = BlobBuilder::new(3)
+            .i32(1)
+            .i32(1)
+            .stroke(0, 0, 2.0, &[[1.0, 2.0, 0.0, 0.0, 2.0, 0.5]])
+            .done();
+        let page = parse_rm_file(&blob).unwrap();
+        assert_eq!(page.version, 3);
+        assert_eq!(page.total_strokes(), 1);
+    }
+
+    #[test]
+    fn flat_layout_parses_without_post_header_padding() {
+        // Same content as the padded builder, but with the layer count
+        // sitting immediately after the 43-byte header.
+        let mut buf = Vec::new();
+        let header = format!("{HEADER_PREFIX}5");
+        buf.extend_from_slice(header.as_bytes());
+        buf.resize(HEADER_LEN, b' ');
+        buf.extend_from_slice(&1i32.to_le_bytes()); // 1 layer
+        buf.extend_from_slice(&1i32.to_le_bytes()); // 1 stroke
+        for v in [0i32, 0, 0] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        buf.extend_from_slice(&2.0f32.to_le_bytes());
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&1i32.to_le_bytes()); // 1 point
+        for v in [7.0f32, 8.0, 0.0, 0.0, 2.0, 0.5] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let page = parse_rm_file(&buf).unwrap();
+        assert_eq!(page.total_strokes(), 1);
+        assert!((page.layers[0].strokes[0].points[0].x - 7.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn v6_header_routes_to_the_block_parser() {
+        // The flat layout must not be applied to a v6 file: these bytes are
+        // a valid v6 block stream, which the flat reader would misread as a
+        // huge layer count.
+        let mut buf = Vec::new();
+        let header = format!("{HEADER_PREFIX}6");
+        buf.extend_from_slice(header.as_bytes());
+        buf.resize(HEADER_LEN, b' ');
+        // One migration-info block: 7 bytes of payload, type 0x00.
+        buf.extend_from_slice(&7u32.to_le_bytes());
+        buf.extend_from_slice(&[0, 1, 1, 0x00]);
+        buf.extend_from_slice(&[0u8; 7]);
+
+        let page = parse_rm_file(&buf).unwrap();
+        assert_eq!(page.version, 6);
+        assert!(page.is_empty(), "no line blocks => no strokes");
     }
 
     #[test]
