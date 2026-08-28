@@ -140,11 +140,31 @@ impl DeviceConnection {
         {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                return Err(map_connect_err(e, &self.config));
+                let mapped = map_connect_err(e, &self.config);
+                tracing::warn!(
+                    host = %self.config.host,
+                    port = self.config.port,
+                    error = %mapped,
+                    "SSH transport connect failed"
+                );
+                return Err(mapped);
             }
-            Err(_) => return Err(ConnectionError::Timeout(self.config.timeout_secs)),
+            Err(_) => {
+                tracing::warn!(
+                    host = %self.config.host,
+                    timeout_secs = self.config.timeout_secs,
+                    "SSH connect timed out"
+                );
+                return Err(ConnectionError::Timeout(self.config.timeout_secs));
+            }
         };
+        tracing::debug!(host = %self.config.host, "SSH transport established");
 
+        let auth_kind = match &self.config.auth {
+            AuthMethod::Password(_) => "password",
+            AuthMethod::KeyFile(_) => "key",
+        };
+        tracing::debug!(username = %self.config.username, method = auth_kind, "authenticating");
         let authed = match &self.config.auth {
             AuthMethod::Password(pw) => session
                 .authenticate_password(&self.config.username, pw)
@@ -161,6 +181,11 @@ impl DeviceConnection {
         };
 
         if !authed {
+            tracing::warn!(
+                username = %self.config.username,
+                method = auth_kind,
+                "device rejected credentials"
+            );
             return Err(ConnectionError::AuthFailed(
                 "server rejected credentials".to_string(),
             ));
@@ -180,10 +205,19 @@ impl DeviceConnection {
 
         self.session = Some(session);
         self.sftp = Some(sftp);
+        tracing::info!(
+            host = %self.config.host,
+            username = %self.config.username,
+            method = auth_kind,
+            "connected to device (SFTP ready)"
+        );
         Ok(())
     }
 
     pub async fn disconnect(&mut self) {
+        if self.session.is_some() {
+            tracing::debug!(host = %self.config.host, "disconnecting from device");
+        }
         if let Some(sftp) = self.sftp.take() {
             let _ = sftp.close().await;
         }

@@ -20,6 +20,7 @@ use tokio::runtime::Runtime;
 
 use crate::config::AppConfig;
 use crate::device::monitor::{DeviceEvent, DeviceMonitor};
+use crate::logging::LogHandle;
 use crate::remarkable::document::DocumentTree;
 use crate::sync::engine::{SyncOrchestrator, SyncPhase, SyncProgressEvent};
 use crate::ui::device_status::DeviceStatusWidget;
@@ -44,8 +45,25 @@ pub struct RmSyncApp {
 }
 
 impl RmSyncApp {
-    pub fn new() -> Self {
-        let config = AppConfig::load().unwrap_or_default();
+    pub fn new(log_handle: LogHandle) -> Self {
+        let config = match AppConfig::load() {
+            Ok(cfg) => {
+                tracing::info!(
+                    sync_dir = %cfg.sync.sync_dir.display(),
+                    host = %cfg.device.host,
+                    auto_sync = cfg.sync.auto_sync_on_connect,
+                    "configuration loaded"
+                );
+                cfg
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = format!("{e:#}"),
+                    "could not load configuration; using defaults"
+                );
+                AppConfig::default()
+            }
+        };
         let config = Rc::new(RefCell::new(config));
         let app = adw::Application::builder()
             .application_id(APP_ID)
@@ -53,7 +71,14 @@ impl RmSyncApp {
         let config_for_activate = config.clone();
         app.connect_activate(move |app| {
             let cfg = config_for_activate.borrow().clone();
+            tracing::debug!("building main window");
             let main = MainWindow::new(app, &cfg);
+            wire_settings_button(
+                &main.settings_button,
+                &main.window,
+                config_for_activate.clone(),
+                log_handle.clone(),
+            );
             load_folder_tree(&main.folder_browser, &cfg);
             wire_folder_browser_to_viewer(
                 &main.folder_browser,
@@ -88,9 +113,13 @@ impl RmSyncApp {
                 cfg.ui.window_width = width;
                 cfg.ui.window_height = height;
                 cfg.ui.sidebar_width = paned.position();
-                let _ = cfg.save();
+                if let Err(e) = cfg.save() {
+                    tracing::warn!(error = format!("{e:#}"), "could not save window geometry");
+                }
+                tracing::debug!(width, height, "main window closing");
                 gtk::glib::Propagation::Proceed
             });
+            tracing::info!("main window ready");
             main.window.present();
         });
         Self { app }
@@ -101,18 +130,42 @@ impl RmSyncApp {
     }
 }
 
-impl Default for RmSyncApp {
-    fn default() -> Self {
-        Self::new()
-    }
+fn wire_settings_button(
+    button: &gtk::Button,
+    window: &adw::ApplicationWindow,
+    config: Rc<RefCell<AppConfig>>,
+    log_handle: LogHandle,
+) {
+    let window = window.clone();
+    button.connect_clicked(move |_| {
+        tracing::debug!("opening settings");
+        crate::ui::settings::present_settings(&window, config.clone(), log_handle.clone());
+    });
 }
 
 fn load_folder_tree(browser: &FolderBrowser, config: &AppConfig) {
     let raw = config.sync.sync_dir.join("raw");
-    if raw.is_dir() {
-        if let Ok(tree) = DocumentTree::build_from_directory(&raw) {
+    if !raw.is_dir() {
+        tracing::warn!(
+            path = %raw.display(),
+            "raw directory missing; sidebar will be empty until the first sync"
+        );
+        return;
+    }
+    match DocumentTree::build_from_directory(&raw) {
+        Ok(tree) => {
+            tracing::info!(
+                documents = tree.flat_list().len(),
+                path = %raw.display(),
+                "loaded document tree"
+            );
             browser.load_tree(&tree);
         }
+        Err(e) => tracing::error!(
+            path = %raw.display(),
+            error = format!("{e:#}"),
+            "could not build document tree"
+        ),
     }
 }
 

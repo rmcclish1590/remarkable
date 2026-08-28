@@ -2,6 +2,7 @@
 
 pub mod device_status;
 pub mod folder_browser;
+pub mod settings;
 pub mod sync_controls;
 pub mod viewer;
 pub mod window;

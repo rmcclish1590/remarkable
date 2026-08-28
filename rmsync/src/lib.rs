@@ -6,6 +6,7 @@ pub mod app;
 pub mod config;
 pub mod device;
 pub mod error;
+pub mod logging;
 pub mod remarkable;
 pub mod sync;
 pub mod ui;

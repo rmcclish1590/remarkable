@@ -183,6 +183,12 @@ impl DocumentViewer {
         let content = RemarkableContent::from_file(&content_path)
             .with_context(|| format!("reading {}", content_path.display()))?;
         let page_ids = content.page_ids();
+        tracing::info!(
+            uuid,
+            pages = page_ids.len(),
+            content = %content_path.display(),
+            "opening document"
+        );
 
         if page_ids.is_empty() {
             self.show_error(
@@ -242,6 +248,12 @@ impl DocumentViewer {
         let total = page_ids.len();
 
         if rendered == 0 {
+            tracing::error!(
+                uuid,
+                pages = total,
+                failures = failures.join("; "),
+                "no pages could be rendered"
+            );
             let detail = if failures.is_empty() {
                 "All page .rm files are missing from the sync directory.".to_string()
             } else {
@@ -255,6 +267,13 @@ impl DocumentViewer {
         }
 
         if !failures.is_empty() {
+            tracing::warn!(
+                uuid,
+                rendered,
+                total,
+                failures = failures.join("; "),
+                "some pages could not be rendered"
+            );
             let warning = gtk::Label::builder()
                 .label(format!(
                     "⚠ {rendered} of {total} pages rendered — {} failed:\n{}",
@@ -422,21 +441,61 @@ fn svg_to_texture_scaled(svg_path: &Path, target_width: u32) -> Result<gdk::Memo
 fn render_and_cache(rm_path: &Path, cache_path: &Path) -> Result<()> {
     let bytes = std::fs::read(rm_path)
         .with_context(|| format!("reading {}", rm_path.display()))?;
+    tracing::debug!(
+        path = %rm_path.display(),
+        bytes = bytes.len(),
+        "rendering page"
+    );
     match parse_rm_file(&bytes) {
         Ok(page) => {
+            // The counts here are what distinguishes "the parser worked and
+            // the page really is blank" from "the parser silently recovered
+            // nothing" — the ambiguity at the heart of MCC-49/MCC-37.
+            tracing::debug!(
+                path = %rm_path.display(),
+                version = page.version,
+                layers = page.layers.len(),
+                strokes = page.total_strokes(),
+                points = page.total_points(),
+                text_chars = page.text.as_ref().map(|t| t.char_count()).unwrap_or(0),
+                "parsed .rm page"
+            );
             let svg = render_page_to_svg(&page);
             // A page that yields no strokes may be using scene features the
             // native parser skips, so let rmscene try. Keep the native blank
             // render when it is unavailable — an empty page is not an error.
-            if page.is_empty() && render_via_rmscene(rm_path, cache_path).is_ok() {
-                return Ok(());
+            if page.is_empty() {
+                tracing::debug!(
+                    path = %rm_path.display(),
+                    "page has no content; trying rmscene fallback"
+                );
+                match render_via_rmscene(rm_path, cache_path) {
+                    Ok(()) => {
+                        tracing::debug!(path = %rm_path.display(), "rmscene fallback rendered page");
+                        return Ok(());
+                    }
+                    Err(e) => tracing::debug!(
+                        path = %rm_path.display(),
+                        error = format!("{e:#}"),
+                        "rmscene fallback unavailable; keeping the blank native render"
+                    ),
+                }
             }
             std::fs::write(cache_path, svg.as_bytes())
                 .with_context(|| format!("writing {}", cache_path.display()))?;
+            tracing::debug!(
+                cache = %cache_path.display(),
+                bytes = svg.len(),
+                "cached rendered page"
+            );
             Ok(())
         }
         Err(e) => {
-            tracing::debug!("native .rm parser failed ({e}), trying rmscene fallback");
+            tracing::warn!(
+                path = %rm_path.display(),
+                error = %e,
+                "native .rm parser failed; trying rmscene fallback"
+            );
             // Keep the native error in the chain: when the fallback also
             // fails, "why the native parser gave up" is the diagnostic
             // that matters.
@@ -461,6 +520,7 @@ fn ensure_cache_version(cache_dir: &Path) -> Result<()> {
             return Ok(());
         }
     }
+    let mut cleared = 0usize;
     for entry in std::fs::read_dir(cache_dir)
         .with_context(|| format!("reading cache dir {}", cache_dir.display()))?
     {
@@ -468,8 +528,15 @@ fn ensure_cache_version(cache_dir: &Path) -> Result<()> {
         if path.extension().is_some_and(|e| e == "svg") {
             std::fs::remove_file(&path)
                 .with_context(|| format!("removing stale cache {}", path.display()))?;
+            cleared += 1;
         }
     }
+    tracing::info!(
+        cleared,
+        render_version = RENDER_VERSION,
+        dir = %cache_dir.display(),
+        "cleared page cache rendered by an older version"
+    );
     std::fs::write(&marker, &current)
         .with_context(|| format!("writing {}", marker.display()))?;
     Ok(())
@@ -478,6 +545,11 @@ fn ensure_cache_version(cache_dir: &Path) -> Result<()> {
 fn render_via_rmscene(rm_path: &Path, cache_path: &Path) -> Result<()> {
     let script = find_rm_to_svg_script()?;
     let pythons = candidate_pythons();
+    tracing::debug!(
+        script = %script.display(),
+        interpreters = pythons.join(", "),
+        "invoking rmscene fallback"
+    );
     let mut last_err = String::new();
     for python in &pythons {
         let result = std::process::Command::new(python)
@@ -486,12 +558,18 @@ fn render_via_rmscene(rm_path: &Path, cache_path: &Path) -> Result<()> {
             .arg(cache_path)
             .output();
         match result {
-            Ok(output) if output.status.success() && cache_path.exists() => return Ok(()),
+            Ok(output) if output.status.success() && cache_path.exists() => {
+                tracing::debug!(python, "rmscene fallback succeeded");
+                return Ok(());
+            }
             Ok(output) => {
                 last_err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                tracing::debug!(python, status = ?output.status.code(), error = %last_err,
+                    "rmscene interpreter failed");
             }
             Err(e) => {
                 last_err = e.to_string();
+                tracing::debug!(python, error = %last_err, "could not run interpreter");
             }
         }
     }

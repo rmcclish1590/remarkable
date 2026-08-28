@@ -75,6 +75,14 @@ There is also a Python fallback (`scripts/rm_to_svg.py`, requires `rmscene`) use
 
 **Threading** (`app.rs`): GTK owns the main thread. Each sync runs on its own `std::thread` with a current-thread tokio runtime, because `rusqlite` is `!Sync`. A separate shared runtime handles device-monitor subscriptions. Events cross back to the UI through a glib channel — never touch GTK widgets from a sync thread.
 
+## Logging
+
+`logging.rs` owns the subscriber. `main.rs` reads the config *before* installing it (the level has to be known first), then hands the resulting `LogHandle` to the app so the settings dialog can change the level at runtime via a `reload` layer.
+
+`LogLevel` filters on two axes, not one: how much `rmsync` itself emits, and whether dependencies emit at all. That is what separates Production (app INFO, deps WARN) from Information (both INFO). `RUST_LOG` overrides the whole scheme when set.
+
+Log to the target that matches the module — a message emitted from a non-`rmsync` target is filtered as a dependency. Prefer structured fields (`tracing::info!(uuid, pages, "opening document")`) over interpolated strings; they are what makes the log greppable. Anything destructive (deletions) logs at INFO with enough identity to reconstruct what happened.
+
 ## Conventions and traps
 
 - **Tablet-supplied identifiers are untrusted.** Anything used to build a filesystem path (UUIDs, page IDs, remote filenames) must go through `is_safe_uuid` / `is_safe_component` in `transfer.rs`. Path traversal via unvalidated page IDs has been a real vulnerability here.
