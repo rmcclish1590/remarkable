@@ -132,6 +132,21 @@ async fn list_remote_files_for_uuid(
     Ok(files)
 }
 
+/// Read a document's parent UUID and type back from the metadata on disk.
+///
+/// Recording every synced item as a parentless `DocumentType` would erase the
+/// folder hierarchy from the state database — folders would stop being
+/// recognisable as folders, and their children would look like roots.
+fn parent_and_type(raw: &Path, uuid: &str) -> (String, String) {
+    match RemarkableMetadata::from_file(&raw.join(format!("{uuid}.metadata"))) {
+        Ok(md) => (md.parent, md.doc_type),
+        Err(e) => {
+            tracing::debug!("no readable metadata for {uuid} ({e}); recording as root document");
+            (String::new(), "DocumentType".into())
+        }
+    }
+}
+
 /// Validate a uuid-like identifier: hex digits and `-` only, length-bounded.
 /// Rejects anything that could escape a path component or pollute globs.
 ///
@@ -267,21 +282,27 @@ where
                     existing.last_sync_at = Some(now);
                     existing
                 }
-                None => SyncFileState {
-                    uuid: action.uuid.clone(),
-                    visible_name: action.visible_name.clone(),
-                    parent_uuid: String::new(),
-                    doc_type: "DocumentType".into(),
-                    local_hash: local_hash.clone(),
-                    remote_hash: local_hash.clone(),
-                    synced_hash: local_hash,
-                    local_mtime: Some(now),
-                    remote_mtime: Some(now),
-                    synced_mtime: Some(now),
-                    last_sync_at: Some(now),
-                    sync_status: SyncStatus::Synced,
-                    conflict_info: None,
-                },
+                None => {
+                    let (parent_uuid, doc_type) = parent_and_type(
+                        &sync_dir.join(crate::sync::scanner::RAW_SUBDIR),
+                        &action.uuid,
+                    );
+                    SyncFileState {
+                        uuid: action.uuid.clone(),
+                        visible_name: action.visible_name.clone(),
+                        parent_uuid,
+                        doc_type,
+                        local_hash: local_hash.clone(),
+                        remote_hash: local_hash.clone(),
+                        synced_hash: local_hash,
+                        local_mtime: Some(now),
+                        remote_mtime: Some(now),
+                        synced_mtime: Some(now),
+                        last_sync_at: Some(now),
+                        sync_status: SyncStatus::Synced,
+                        conflict_info: None,
+                    }
+                }
             };
             db.upsert_state(&state)?;
         } else if let Some(mut state) = db.get_state(&result.uuid)? {
@@ -473,21 +494,27 @@ where
                     existing.last_sync_at = Some(now);
                     existing
                 }
-                None => SyncFileState {
-                    uuid: action.uuid.clone(),
-                    visible_name: action.visible_name.clone(),
-                    parent_uuid: String::new(),
-                    doc_type: "DocumentType".into(),
-                    local_hash: local_hash.clone(),
-                    remote_hash: local_hash.clone(),
-                    synced_hash: local_hash,
-                    local_mtime: Some(now),
-                    remote_mtime: Some(now),
-                    synced_mtime: Some(now),
-                    last_sync_at: Some(now),
-                    sync_status: SyncStatus::Synced,
-                    conflict_info: None,
-                },
+                None => {
+                    let (parent_uuid, doc_type) = parent_and_type(
+                        &sync_dir.join(crate::sync::scanner::RAW_SUBDIR),
+                        &action.uuid,
+                    );
+                    SyncFileState {
+                        uuid: action.uuid.clone(),
+                        visible_name: action.visible_name.clone(),
+                        parent_uuid,
+                        doc_type,
+                        local_hash: local_hash.clone(),
+                        remote_hash: local_hash.clone(),
+                        synced_hash: local_hash,
+                        local_mtime: Some(now),
+                        remote_mtime: Some(now),
+                        synced_mtime: Some(now),
+                        last_sync_at: Some(now),
+                        sync_status: SyncStatus::Synced,
+                        conflict_info: None,
+                    }
+                }
             };
             db.upsert_state(&state)?;
         } else if let Some(mut state) = db.get_state(&result.uuid)? {

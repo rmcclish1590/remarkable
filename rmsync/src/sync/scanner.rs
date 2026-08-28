@@ -21,6 +21,11 @@ pub const XOCHITL_PATH: &str = "/home/root/.local/share/remarkable/xochitl";
 /// know whether they changed.
 pub const FULL_HASH_THRESHOLD: u64 = 1_000_000;
 
+/// Bound on how far the parent chain is followed when filling in folders.
+/// Deeper than any real reMarkable hierarchy, and stops a cycle in device
+/// metadata from looping forever.
+const MAX_FOLDER_DEPTH: usize = 32;
+
 #[derive(Debug, Clone)]
 pub struct RemoteDocumentSnapshot {
     pub uuid: String,
@@ -91,12 +96,67 @@ where
         });
     }
 
+    // Documents carry only their parent's UUID, so a folder that the sweep
+    // above missed leaves its children looking parentless — they get promoted
+    // to the root and the local tree collapses into one flat list.
+    fetch_missing_parents(conn, &entries, &mut documents, &mut total_size).await;
+
     Ok(RemoteManifest {
         total_documents: documents.len(),
         total_size_bytes: total_size,
         documents,
         scanned_at: now_unix(),
     })
+}
+
+/// Walk up the parent chain, pulling in any ancestor folder the scan does not
+/// already have. Repeats until the set is closed so folders nested many deep
+/// are all present, and is bounded in case the device reports a parent cycle.
+async fn fetch_missing_parents(
+    conn: &DeviceConnection,
+    entries: &[RemoteFileInfo],
+    documents: &mut Vec<RemoteDocumentSnapshot>,
+    total_size: &mut u64,
+) {
+    for _ in 0..MAX_FOLDER_DEPTH {
+        let missing = missing_parent_uuids(documents);
+        if missing.is_empty() {
+            return;
+        }
+        let before = documents.len();
+        for uuid in missing {
+            match build_snapshot(conn, &uuid, entries).await {
+                Ok(Some(snap)) => {
+                    *total_size += snap.total_size_bytes;
+                    documents.push(snap);
+                }
+                // A trashed or unreadable ancestor is not fatal: the children
+                // simply stay at the root, which is what they did before.
+                Ok(None) => tracing::debug!("parent folder {uuid} is deleted; skipping"),
+                Err(e) => tracing::warn!("could not read parent folder {uuid}: {e:#}"),
+            }
+        }
+        if documents.len() == before {
+            return; // nothing resolvable; stop rather than spin
+        }
+    }
+    tracing::warn!("folder nesting exceeded {MAX_FOLDER_DEPTH} levels; tree may be partial");
+}
+
+/// Parent UUIDs referenced by these snapshots that are not themselves present.
+/// Roots (`""`) and the trash bucket are not folders and never resolve.
+pub(crate) fn missing_parent_uuids(documents: &[RemoteDocumentSnapshot]) -> Vec<String> {
+    let present: std::collections::HashSet<&str> =
+        documents.iter().map(|d| d.uuid.as_str()).collect();
+    let mut missing: Vec<String> = documents
+        .iter()
+        .map(|d| d.metadata.parent.as_str())
+        .filter(|p| !p.is_empty() && *p != "trash" && !present.contains(p))
+        .map(str::to_string)
+        .collect();
+    missing.sort();
+    missing.dedup();
+    missing
 }
 
 fn collect_uuids(entries: &[RemoteFileInfo]) -> Vec<String> {
@@ -695,6 +755,57 @@ mod tests {
             file_list: vec![],
         }
     }
+    fn snap_with_parent(uuid: &str, parent: &str, doc_type: &str) -> RemoteDocumentSnapshot {
+        let mut snap = mk_remote("h");
+        snap.uuid = uuid.into();
+        snap.metadata = serde_json::from_str(&format!(
+            r#"{{"deleted":false,"lastModified":"1","parent":"{parent}","pinned":false,"type":"{doc_type}","visibleName":"n"}}"#
+        ))
+        .unwrap();
+        snap
+    }
+
+    #[test]
+    fn missing_parents_are_reported_once_each() {
+        let docs = vec![
+            snap_with_parent("d1", "folder-A", "DocumentType"),
+            snap_with_parent("d2", "folder-A", "DocumentType"),
+            snap_with_parent("d3", "folder-B", "DocumentType"),
+        ];
+        assert_eq!(missing_parent_uuids(&docs), vec!["folder-A", "folder-B"]);
+    }
+
+    #[test]
+    fn present_parents_and_non_folders_are_not_reported() {
+        let docs = vec![
+            snap_with_parent("folder-A", "", "CollectionType"),
+            snap_with_parent("d1", "folder-A", "DocumentType"), // parent present
+            snap_with_parent("d2", "", "DocumentType"),         // root
+            snap_with_parent("d3", "trash", "DocumentType"),    // trashed
+        ];
+        assert!(
+            missing_parent_uuids(&docs).is_empty(),
+            "nothing left to fetch"
+        );
+    }
+
+    #[test]
+    fn nested_parents_resolve_one_level_per_pass() {
+        // grandchild -> sub -> top, with only the grandchild present at first.
+        let mut docs = vec![snap_with_parent("d1", "sub", "DocumentType")];
+        assert_eq!(missing_parent_uuids(&docs), vec!["sub"]);
+
+        docs.push(snap_with_parent("sub", "top", "CollectionType"));
+        assert_eq!(
+            missing_parent_uuids(&docs),
+            vec!["top"],
+            "resolving one level exposes the next"
+        );
+
+        docs.push(snap_with_parent("top", "", "CollectionType"));
+        assert!(missing_parent_uuids(&docs).is_empty());
+    }
+
     fn mk_synced(hash: &str) -> SyncFileState {
         SyncFileState {
             uuid: "u".into(),

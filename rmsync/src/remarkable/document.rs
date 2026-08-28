@@ -102,6 +102,32 @@ impl DocumentTree {
         walk(&self.roots, &mut out);
         out
     }
+
+    /// The names of the folders containing `uuid`, outermost first.
+    ///
+    /// Empty for an item sitting at the top level; `None` if the uuid is not
+    /// in the tree. Nesting is followed to any depth.
+    pub fn folder_path(&self, uuid: &str) -> Option<Vec<&str>> {
+        fn walk<'a>(
+            nodes: &'a [DocumentNode],
+            uuid: &str,
+            trail: &mut Vec<&'a str>,
+        ) -> bool {
+            for n in nodes {
+                if n.uuid == uuid {
+                    return true;
+                }
+                trail.push(n.metadata.visible_name.as_str());
+                if walk(&n.children, uuid, trail) {
+                    return true;
+                }
+                trail.pop();
+            }
+            false
+        }
+        let mut trail = Vec::new();
+        walk(&self.roots, uuid, &mut trail).then_some(trail)
+    }
 }
 
 fn build_node(
@@ -171,6 +197,48 @@ mod tests {
             page_ids.join(",")
         );
         fs::write(dir.join(format!("{uuid}.content")), json).unwrap();
+    }
+
+    #[test]
+    fn folder_path_reports_nesting_outermost_first() {
+        let td = tempdir().unwrap();
+        let p = td.path();
+
+        write_meta(p, "folder-A", "", "CollectionType", "Work", false);
+        write_meta(p, "sub-folder", "folder-A", "CollectionType", "Sub", false);
+        write_meta(p, "doc-deep", "sub-folder", "DocumentType", "Deep", false);
+        write_meta(p, "doc-root", "", "DocumentType", "Alone", false);
+
+        let tree = DocumentTree::build_from_directory(p).unwrap();
+
+        assert_eq!(tree.folder_path("doc-deep"), Some(vec!["Work", "Sub"]));
+        assert_eq!(tree.folder_path("sub-folder"), Some(vec!["Work"]));
+        assert_eq!(tree.folder_path("doc-root"), Some(vec![]));
+        assert_eq!(tree.folder_path("nope"), None);
+    }
+
+    #[test]
+    fn documents_flatten_to_root_when_their_folder_is_missing() {
+        // The failure this guards: folder metadata never reached the sync
+        // directory, so every document looked parentless and the tree
+        // collapsed into one alphabetical list.
+        let td = tempdir().unwrap();
+        let p = td.path();
+
+        write_meta(p, "doc-1", "absent-folder", "DocumentType", "Notes", false);
+        write_meta(p, "doc-2", "absent-folder", "DocumentType", "More", false);
+
+        let tree = DocumentTree::build_from_directory(p).unwrap();
+        assert_eq!(tree.roots.len(), 2, "both promoted to root");
+        assert_eq!(tree.folder_path("doc-1"), Some(vec![]));
+
+        // With the folder present, the same documents nest under it.
+        write_meta(p, "absent-folder", "", "CollectionType", "Work", false);
+        let tree = DocumentTree::build_from_directory(p).unwrap();
+        assert_eq!(tree.roots.len(), 1);
+        assert_eq!(tree.roots[0].uuid, "absent-folder");
+        assert_eq!(tree.folder_path("doc-1"), Some(vec!["Work"]));
+        assert_eq!(tree.folder_path("doc-2"), Some(vec!["Work"]));
     }
 
     #[test]
