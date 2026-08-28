@@ -369,12 +369,18 @@ fn render_and_cache(rm_path: &Path, cache_path: &Path) -> Result<()> {
     match parse_rm_file(&bytes) {
         Ok(page) => {
             let svg = render_page_to_svg(&page);
+            // A page that yields no strokes may be using scene features the
+            // native parser skips, so let rmscene try. Keep the native blank
+            // render when it is unavailable — an empty page is not an error.
+            if page.is_empty() && render_via_rmscene(rm_path, cache_path).is_ok() {
+                return Ok(());
+            }
             std::fs::write(cache_path, svg.as_bytes())
                 .with_context(|| format!("writing {}", cache_path.display()))?;
             Ok(())
         }
         Err(e) => {
-            tracing::debug!("flat v6 parser failed ({e}), trying rmscene fallback");
+            tracing::debug!("native .rm parser failed ({e}), trying rmscene fallback");
             render_via_rmscene(rm_path, cache_path)
                 .with_context(|| format!("rmscene fallback for {}", rm_path.display()))
         }
