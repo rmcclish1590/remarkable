@@ -7,8 +7,11 @@
 //! defers decoding until the picture becomes visible, giving effectively
 //! lazy rendering without bespoke machinery. A scroll listener updates the
 //! page counter based on viewport centre.
+//!
+//! Selecting a document always lands on page 1 at the very top, regardless
+//! of where the previously open document was scrolled to (MCC-52).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -42,6 +45,10 @@ pub struct DocumentViewer {
     stack: gtk::Stack,
     page_info_label: gtk::Label,
     current_doc: Rc<RefCell<Option<LoadedDocument>>>,
+    /// Set by `load_document` so the first re-layout after the new pages
+    /// are attached snaps the viewport back to the top. See
+    /// `reset_scroll_to_top`.
+    pending_top_reset: Rc<Cell<bool>>,
 }
 
 impl DocumentViewer {
@@ -127,6 +134,22 @@ impl DocumentViewer {
 
         let current_doc: Rc<RefCell<Option<LoadedDocument>>> = Rc::new(RefCell::new(None));
 
+        // Snapping to the top in `load_document` is not enough on its own:
+        // at that moment the new page widgets have not been allocated, so
+        // the scrolled window's `upper` still describes the *previous*
+        // document. When layout catches up, GTK re-emits `changed` with the
+        // new extents and the stale offset would resurface. The flag makes
+        // the reset survive that first re-layout.
+        let pending_top_reset = Rc::new(Cell::new(false));
+        let pending_for_changed = pending_top_reset.clone();
+        let hadj_for_changed = scroll.hadjustment();
+        scroll.vadjustment().connect_changed(move |adj| {
+            if pending_for_changed.get() {
+                pending_for_changed.set(false);
+                scroll_adjustments_to_top(&hadj_for_changed, adj);
+            }
+        });
+
         let adj = scroll.vadjustment();
         let info_for_scroll = page_info_label.clone();
         let current_for_scroll = current_doc.clone();
@@ -150,6 +173,7 @@ impl DocumentViewer {
             stack,
             page_info_label,
             current_doc,
+            pending_top_reset,
         }
     }
 
@@ -297,11 +321,35 @@ impl DocumentViewer {
             uuid: uuid.to_string(),
             page_widgets,
         });
+        self.reset_scroll_to_top();
         Ok(())
+    }
+
+    /// Put the viewport back at the top-left of page 1.
+    ///
+    /// Runs in three beats because a scrolled window's extents lag its
+    /// content by one layout pass: zero the adjustments now (covers the
+    /// case where the new document has the same extents as the old one,
+    /// so no `changed` is ever emitted), arm the `changed` handler
+    /// installed in `new()` for the re-layout, and disarm it on the next
+    /// idle so a later window resize cannot yank the user back to the top.
+    fn reset_scroll_to_top(&self) {
+        scroll_adjustments_to_top(&self.scroll.hadjustment(), &self.scroll.vadjustment());
+        self.pending_top_reset.set(true);
+
+        let pending = self.pending_top_reset.clone();
+        let scroll = self.scroll.clone();
+        glib::idle_add_local_once(move || {
+            if pending.replace(false) {
+                scroll_adjustments_to_top(&scroll.hadjustment(), &scroll.vadjustment());
+            }
+        });
     }
 
     pub fn clear(&self) {
         self.clear_pages_box();
+        self.pending_top_reset.set(false);
+        scroll_adjustments_to_top(&self.scroll.hadjustment(), &self.scroll.vadjustment());
         *self.current_doc.borrow_mut() = None;
         self.page_info_label.set_text("");
         self.stack.set_visible_child_name("placeholder");
@@ -679,6 +727,15 @@ fn build_page_widget(svg_path: &Path, page_number: usize) -> gtk::Box {
     page.append(&separator);
     page.append(&picture);
     page
+}
+
+/// Scroll both axes back to their lower bound (top-left of the content).
+///
+/// `lower` rather than a literal `0.0`: an adjustment's origin is not
+/// required to be zero, and GTK clamps out-of-range values silently.
+fn scroll_adjustments_to_top(hadj: &gtk::Adjustment, vadj: &gtk::Adjustment) {
+    vadj.set_value(vadj.lower());
+    hadj.set_value(hadj.lower());
 }
 
 fn widget_y_in_box(widget: &gtk::Box) -> i32 {
