@@ -79,12 +79,26 @@ pub fn setup_folder_selector(
 /// subdirectories, and persist to disk. Returns an error if the directory
 /// tree cannot be created (e.g. read-only filesystem).
 pub fn apply_sync_dir(config: &Rc<RefCell<AppConfig>>, path: &Path) -> anyhow::Result<()> {
-    {
-        let mut cfg = config.borrow_mut();
-        cfg.sync.sync_dir = path.to_path_buf();
-        cfg.ensure_directories()?;
-        cfg.save()?;
-    }
+    apply_sync_dir_to(config, path, &AppConfig::config_path())
+}
+
+/// `apply_sync_dir` with an explicit destination for the config file.
+///
+/// The destination is a parameter rather than something this function
+/// looks up so that tests can exercise it without writing to the config
+/// of whoever is running them — reaching for `AppConfig::config_path()`
+/// internally meant every `cargo test` run silently repointed the
+/// developer's own `sync_dir` at a temp directory that was then deleted
+/// (MCC-51).
+pub fn apply_sync_dir_to(
+    config: &Rc<RefCell<AppConfig>>,
+    path: &Path,
+    config_path: &Path,
+) -> anyhow::Result<()> {
+    let mut cfg = config.borrow_mut();
+    cfg.sync.sync_dir = path.to_path_buf();
+    cfg.ensure_directories()?;
+    cfg.save_to(config_path)?;
     Ok(())
 }
 
@@ -465,14 +479,42 @@ mod tests {
     #[test]
     fn apply_sync_dir_writes_config_and_creates_subdirs() {
         let dir = tempdir().unwrap();
-        let cfg_dir = dir.path().join("cfg");
+        let config_path = dir.path().join("cfg").join("config.toml");
         let sync = dir.path().join("sync");
-        std::fs::create_dir_all(&cfg_dir).unwrap();
         let cfg = Rc::new(RefCell::new(AppConfig::default()));
-        apply_sync_dir(&cfg, &sync).unwrap();
+
+        apply_sync_dir_to(&cfg, &sync, &config_path).unwrap();
+
         assert_eq!(cfg.borrow().sync.sync_dir, sync);
         assert!(sync.join("raw").is_dir());
         assert!(sync.join(".rmsync").is_dir());
+
+        // The new directory must actually reach the file, not just memory.
+        let written = AppConfig::load_from(&config_path).unwrap();
+        assert_eq!(written.sync.sync_dir, sync);
+    }
+
+    #[test]
+    fn apply_sync_dir_writes_only_to_the_path_it_is_given() {
+        // Regression test for MCC-51: this function used to resolve the
+        // real user config internally, so running the test suite rewrote
+        // the developer's own sync_dir to a temp path that was deleted
+        // moments later, leaving the app pointing at nothing.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let real_path = AppConfig::config_path();
+        let real_before = std::fs::read(&real_path).ok();
+
+        let cfg = Rc::new(RefCell::new(AppConfig::default()));
+        apply_sync_dir_to(&cfg, &dir.path().join("sync"), &config_path).unwrap();
+
+        assert!(config_path.exists(), "the given path should be written");
+        assert_eq!(
+            std::fs::read(&real_path).ok(),
+            real_before,
+            "the real user config at {} must be left untouched",
+            real_path.display()
+        );
     }
 
     #[test]
@@ -536,6 +578,11 @@ mod tests {
         std::fs::write(&blocker, b"not a dir").unwrap();
         let target = blocker.join("under-a-file");
         let cfg = Rc::new(RefCell::new(AppConfig::default()));
-        assert!(apply_sync_dir(&cfg, &target).is_err());
+        let config_path = dir.path().join("config.toml");
+        assert!(apply_sync_dir_to(&cfg, &target, &config_path).is_err());
+        assert!(
+            !config_path.exists(),
+            "a failed directory setup must not persist the new path"
+        );
     }
 }
