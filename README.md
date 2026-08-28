@@ -104,6 +104,28 @@ Launch **rmSync** from the application menu (it appears under Utilities after in
 
 Settings are stored in `~/.config/rmsync/config.toml`, created with defaults on first run. Synced documents are stored in the sync folder chosen above.
 
+### Logging
+
+rmSync writes a log to `~/.local/share/rmsync/logs/rmsync.log`. It is the first thing to look at when something goes wrong, and the right thing to attach to a bug report.
+
+Open the gear icon in the header bar to change how much is recorded. The setting applies immediately — no restart — and is remembered:
+
+| Level | What it records |
+|---|---|
+| Errors only | Warnings and errors, nothing about normal operation. |
+| Production *(default)* | What rmSync does — startup, sync phases, documents opened, deletions — plus any problems. |
+| Information | The above, plus informational messages from supporting libraries (SSH, storage). |
+| Debug | Everything, including per-file and per-page detail. Verbose enough to slow a large sync down; use it to reproduce a specific bug. |
+
+To capture a problem: set **Debug**, reproduce it, then send the log file.
+
+The log rotates at 5 MB, keeping 5 previous files (`rmsync.log.1` … `.5`). Two environment variables override the defaults:
+
+```bash
+RMSYNC_LOG_DIR=/path/to/dir rmsync   # write logs somewhere else
+RUST_LOG=rmsync::sync=trace rmsync   # per-module control; overrides the UI setting
+```
+
 ## Development
 
 Run the test suite from the `rmsync` directory:

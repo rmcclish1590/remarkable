@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::device::connection::{AuthMethod, ConnectionConfig};
+use crate::logging::LogLevel;
 
 const CONFIG_FILENAME: &str = "config.toml";
 const APP_CONFIG_SUBDIR: &str = "rmsync";
@@ -115,6 +116,12 @@ impl Default for UiConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LoggingConfig {
+    #[serde(default)]
+    pub level: LogLevel,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
     #[serde(default)]
     pub sync: SyncConfig,
@@ -122,6 +129,8 @@ pub struct AppConfig {
     pub device: DeviceConfig,
     #[serde(default)]
     pub ui: UiConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
 
 impl AppConfig {
@@ -237,6 +246,39 @@ mod tests {
         c.save_to(&path).unwrap();
         let loaded = AppConfig::load_from(&path).unwrap();
         assert_eq!(loaded, c);
+    }
+
+    #[test]
+    fn log_level_persists_across_save_and_load() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut c = AppConfig::default();
+        c.logging.level = LogLevel::Debug;
+        c.save_to(&path).unwrap();
+
+        let loaded = AppConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.logging.level, LogLevel::Debug);
+    }
+
+    #[test]
+    fn config_without_logging_section_gets_the_default_level() {
+        // Configs written by earlier versions have no [logging] table.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("old.toml");
+        std::fs::write(&path, "[sync]\nauto_sync_on_connect = true\n").unwrap();
+
+        let c = AppConfig::load_from(&path).unwrap();
+        assert_eq!(c.logging.level, LogLevel::default());
+    }
+
+    #[test]
+    fn unknown_log_level_in_config_is_an_error_not_a_silent_default() {
+        // Silently downgrading a misspelled level would leave a user
+        // wondering why Debug never took effect.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bad.toml");
+        std::fs::write(&path, "[logging]\nlevel = \"verbose\"\n").unwrap();
+        assert!(AppConfig::load_from(&path).is_err());
     }
 
     #[test]

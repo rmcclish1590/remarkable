@@ -451,11 +451,23 @@ impl SyncOrchestrator {
         let start = Instant::now();
         let sync_dir = self.config.sync.sync_dir.clone();
         let mut report = SyncReport::default();
+        tracing::info!(
+            sync_dir = %sync_dir.display(),
+            host = %self.config.device.host,
+            "sync started"
+        );
 
         // 1. Connect
         callback(SyncProgressEvent::Phase(SyncPhase::Connecting));
+        tracing::debug!(
+            host = %self.config.device.host,
+            port = self.config.device.port,
+            username = %self.config.device.username,
+            "connecting to device"
+        );
         if let Err(e) = self.connection.connect().await {
             let msg = format!("connect failed: {e}");
+            tracing::error!(error = format!("{e:#}"), "could not connect to device");
             callback(SyncProgressEvent::Error(msg.clone()));
             report.errors.push(msg);
             report.duration_ms = start.elapsed().as_millis() as u64;
@@ -474,9 +486,17 @@ impl SyncOrchestrator {
         })
         .await
         {
-            Ok(m) => m,
+            Ok(m) => {
+                tracing::info!(
+                    documents = m.total_documents,
+                    bytes = m.total_size_bytes,
+                    "remote scan complete"
+                );
+                m
+            }
             Err(e) => {
                 let msg = format!("remote scan failed: {e}");
+                tracing::error!(error = format!("{e:#}"), "remote scan failed");
                 callback(SyncProgressEvent::Error(msg.clone()));
                 report.errors.push(msg);
                 return Ok(self.finalise(start, report, &callback).await);
@@ -489,9 +509,22 @@ impl SyncOrchestrator {
         // 3. Scan local
         callback(SyncProgressEvent::Phase(SyncPhase::ScanningLocal));
         let local = match scan_local(&sync_dir) {
-            Ok(m) => m,
+            Ok(m) => {
+                tracing::info!(
+                    documents = m.total_documents,
+                    bytes = m.total_size_bytes,
+                    path = %sync_dir.join("raw").display(),
+                    "local scan complete"
+                );
+                m
+            }
             Err(e) => {
                 let msg = format!("local scan failed: {e}");
+                tracing::error!(
+                    path = %sync_dir.display(),
+                    error = format!("{e:#}"),
+                    "local scan failed"
+                );
                 callback(SyncProgressEvent::Error(msg.clone()));
                 report.errors.push(msg);
                 return Ok(self.finalise(start, report, &callback).await);
@@ -501,9 +534,19 @@ impl SyncOrchestrator {
         // 4. Compute diff
         callback(SyncProgressEvent::Phase(SyncPhase::ComputingDiff));
         let plan = match compute_sync_plan(&local, &remote, &self.db) {
-            Ok(p) => p,
+            Ok(p) => {
+                tracing::info!(
+                    pull = p.total_pull,
+                    push = p.total_push,
+                    delete = p.total_delete,
+                    conflicts = p.has_conflicts(),
+                    "sync plan computed"
+                );
+                p
+            }
             Err(e) => {
                 let msg = format!("diff failed: {e}");
+                tracing::error!(error = format!("{e:#}"), "diff failed");
                 callback(SyncProgressEvent::Error(msg.clone()));
                 report.errors.push(msg);
                 return Ok(self.finalise(start, report, &callback).await);
@@ -516,12 +559,20 @@ impl SyncOrchestrator {
             match resolve_all_conflicts(&self.connection, &plan, &local, &remote, &sync_dir, &self.db).await {
                 Ok(resolutions) => {
                     report.conflicts_resolved = resolutions.len();
+                    tracing::info!(resolved = resolutions.len(), "conflicts resolved");
                     for r in resolutions {
-                        callback(SyncProgressEvent::ConflictResolved(r.to_notification()));
+                        let n = r.to_notification();
+                        tracing::info!(
+                            document = %n.document_name,
+                            winner = %n.winner_source,
+                            "conflict resolved"
+                        );
+                        callback(SyncProgressEvent::ConflictResolved(n));
                     }
                 }
                 Err(e) => {
                     let msg = format!("conflict resolution failed: {e}");
+                    tracing::error!(error = format!("{e:#}"), "conflict resolution failed");
                     callback(SyncProgressEvent::Error(msg.clone()));
                     report.errors.push(msg);
                 }
@@ -539,14 +590,21 @@ impl SyncOrchestrator {
             {
                 Ok(results) => {
                     report.pulled = results.iter().filter(|r| r.success).count();
+                    tracing::info!(
+                        pulled = report.pulled,
+                        failed = results.len() - report.pulled,
+                        "pull batch complete"
+                    );
                     for r in results.iter().filter(|r| !r.success) {
                         if let Some(e) = &r.error {
+                            tracing::error!(uuid = %r.uuid, error = %e, "pull failed");
                             report.errors.push(format!("pull {}: {e}", r.uuid));
                         }
                     }
                 }
                 Err(e) => {
                     let msg = format!("pull batch failed: {e}");
+                    tracing::error!(error = format!("{e:#}"), "pull batch failed");
                     callback(SyncProgressEvent::Error(msg.clone()));
                     report.errors.push(msg);
                 }
@@ -564,14 +622,21 @@ impl SyncOrchestrator {
             {
                 Ok(results) => {
                     report.pushed = results.iter().filter(|r| r.success).count();
+                    tracing::info!(
+                        pushed = report.pushed,
+                        failed = results.len() - report.pushed,
+                        "push batch complete"
+                    );
                     for r in results.iter().filter(|r| !r.success) {
                         if let Some(e) = &r.error {
+                            tracing::error!(uuid = %r.uuid, error = %e, "push failed");
                             report.errors.push(format!("push {}: {e}", r.uuid));
                         }
                     }
                 }
                 Err(e) => {
                     let msg = format!("push batch failed: {e}");
+                    tracing::error!(error = format!("{e:#}"), "push batch failed");
                     callback(SyncProgressEvent::Error(msg.clone()));
                     report.errors.push(msg);
                 }
@@ -581,10 +646,21 @@ impl SyncOrchestrator {
         // 8. Deletes
         if plan.total_delete > 0 && !self.cancel.is_cancelled() {
             callback(SyncProgressEvent::Phase(SyncPhase::Deleting));
+            // Deletions are the only destructive step and the hardest to
+            // reconstruct after the fact, so each one is logged at INFO
+            // with its uuid — a user who loses a document needs to be able
+            // to see whether rmSync removed it, and from which side.
+            tracing::info!(count = plan.total_delete, "applying deletions");
             for action in plan.actions.iter() {
                 match &action.action_type {
                     SyncActionType::DeleteLocal => {
+                        tracing::info!(uuid = %action.uuid, side = "local", "deleting document");
                         if let Err(e) = delete_local_document(&action.uuid, &sync_dir) {
+                            tracing::error!(
+                                uuid = %action.uuid,
+                                error = format!("{e:#}"),
+                                "local delete failed"
+                            );
                             report.errors.push(format!("delete local {}: {e}", action.uuid));
                         } else {
                             let _ = self.db.delete_state(&action.uuid);
@@ -592,7 +668,13 @@ impl SyncOrchestrator {
                         }
                     }
                     SyncActionType::DeleteRemote => {
+                        tracing::info!(uuid = %action.uuid, side = "remote", "deleting document");
                         if let Err(e) = delete_remote_document(&self.connection, &action.uuid).await {
+                            tracing::error!(
+                                uuid = %action.uuid,
+                                error = format!("{e:#}"),
+                                "remote delete failed"
+                            );
                             report.errors.push(format!("delete remote {}: {e}", action.uuid));
                         } else {
                             let _ = self.db.delete_state(&action.uuid);
@@ -630,6 +712,26 @@ impl SyncOrchestrator {
         callback(SyncProgressEvent::Phase(SyncPhase::Finalizing));
         self.connection.disconnect().await;
         report.duration_ms = start.elapsed().as_millis() as u64;
+        if report.errors.is_empty() {
+            tracing::info!(
+                pulled = report.pulled,
+                pushed = report.pushed,
+                deleted = report.deleted,
+                conflicts_resolved = report.conflicts_resolved,
+                duration_ms = report.duration_ms,
+                "sync finished"
+            );
+        } else {
+            tracing::warn!(
+                pulled = report.pulled,
+                pushed = report.pushed,
+                deleted = report.deleted,
+                errors = report.errors.len(),
+                duration_ms = report.duration_ms,
+                first_error = %report.errors[0],
+                "sync finished with errors"
+            );
+        }
         callback(SyncProgressEvent::Complete(report.clone()));
         report
     }

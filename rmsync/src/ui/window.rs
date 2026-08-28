@@ -20,6 +20,7 @@ const MIN_VIEWER_WIDTH: i32 = 400;
 pub struct MainWindow {
     pub window: adw::ApplicationWindow,
     pub header_bar: adw::HeaderBar,
+    pub settings_button: gtk::Button,
     pub sync_path_entry: gtk::Entry,
     pub browse_button: gtk::Button,
     pub last_sync_label: gtk::Label,
@@ -46,8 +47,13 @@ impl MainWindow {
         let header_bar = adw::HeaderBar::builder()
             .title_widget(&gtk::Label::builder().label("rmSync").build())
             .build();
+        let settings_button = gtk::Button::builder()
+            .icon_name("emblem-system-symbolic")
+            .tooltip_text("Settings")
+            .build();
         header_bar.pack_start(&device_status.widget);
         header_bar.pack_end(&sync_controls.sync_button);
+        header_bar.pack_end(&settings_button);
 
         let toolbar = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -113,6 +119,7 @@ impl MainWindow {
         Self {
             window,
             header_bar,
+            settings_button,
             sync_path_entry,
             browse_button,
             last_sync_label,
