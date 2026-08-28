@@ -19,7 +19,7 @@ use gtk::prelude::*;
 
 use crate::remarkable::metadata::RemarkableContent;
 use crate::remarkable::rm_parser::parse_rm_file;
-use crate::remarkable::svg_renderer::render_page_to_svg;
+use crate::remarkable::svg_renderer::{render_page_to_svg, RENDER_VERSION};
 use crate::sync::transfer::{is_safe_component, is_safe_uuid};
 
 const REMARKABLE_PAGE_WIDTH: i32 = 1404;
@@ -176,6 +176,8 @@ impl DocumentViewer {
         let cache = sync_dir.join(".rmsync").join("cache");
         std::fs::create_dir_all(&cache)
             .with_context(|| format!("creating cache dir {}", cache.display()))?;
+        ensure_cache_version(&cache)
+            .with_context(|| format!("refreshing render cache {}", cache.display()))?;
 
         let content_path = raw.join(format!("{uuid}.content"));
         let content = RemarkableContent::from_file(&content_path)
@@ -219,7 +221,10 @@ impl DocumentViewer {
                 match render_and_cache(&rm_path, &cache_path) {
                     Ok(()) => {}
                     Err(e) => {
-                        failures.push(format!("page {}: {e}", i + 1));
+                        // {:#} prints the whole context chain — the outer
+                        // context alone ("rmscene fallback for …") hides
+                        // the actual reason a page failed to render.
+                        failures.push(format!("page {}: {e:#}", i + 1));
                         continue;
                     }
                 }
@@ -338,10 +343,61 @@ fn svg_to_texture(svg_path: &Path) -> Result<gdk::MemoryTexture> {
     svg_to_texture_scaled(svg_path, DEFAULT_RENDER_WIDTH)
 }
 
+/// System fonts for rendering `<text>` elements (typed-text pages).
+/// usvg's default font database is empty, which silently drops text.
+/// Loading system fonts takes tens of milliseconds, so do it once.
+///
+/// The generic `sans-serif` family must also be pointed at a font that is
+/// actually installed: fontdb's built-in default resolves to a face most
+/// Linux systems don't have, and an unresolvable family makes usvg drop
+/// the text as silently as an empty database does.
+fn shared_fontdb() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
+    static DB: std::sync::OnceLock<std::sync::Arc<resvg::usvg::fontdb::Database>> =
+        std::sync::OnceLock::new();
+    DB.get_or_init(|| {
+        use resvg::usvg::fontdb;
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        let candidates = [
+            "DejaVu Sans",
+            "Liberation Sans",
+            "Noto Sans",
+            "Ubuntu",
+            "Cantarell",
+            "Arial",
+        ];
+        let installed = |name: &str| {
+            db.query(&fontdb::Query {
+                families: &[fontdb::Family::Name(name)],
+                ..Default::default()
+            })
+            .is_some()
+        };
+        let family = candidates
+            .iter()
+            .find(|name| installed(name))
+            .map(|name| name.to_string())
+            .or_else(|| {
+                // Last resort: any face at all beats invisible text.
+                db.faces()
+                    .next()
+                    .and_then(|f| f.families.first().map(|(name, _)| name.clone()))
+            });
+        if let Some(family) = family {
+            db.set_sans_serif_family(family);
+        }
+        std::sync::Arc::new(db)
+    })
+    .clone()
+}
+
 fn svg_to_texture_scaled(svg_path: &Path, target_width: u32) -> Result<gdk::MemoryTexture> {
     let svg_bytes = std::fs::read(svg_path)
         .with_context(|| format!("reading {}", svg_path.display()))?;
-    let options = resvg::usvg::Options::default();
+    let options = resvg::usvg::Options {
+        fontdb: shared_fontdb(),
+        ..Default::default()
+    };
     let tree = resvg::usvg::Tree::from_data(&svg_bytes, &options)
         .with_context(|| "parsing SVG")?;
     let size = tree.size();
@@ -381,10 +437,42 @@ fn render_and_cache(rm_path: &Path, cache_path: &Path) -> Result<()> {
         }
         Err(e) => {
             tracing::debug!("native .rm parser failed ({e}), trying rmscene fallback");
-            render_via_rmscene(rm_path, cache_path)
-                .with_context(|| format!("rmscene fallback for {}", rm_path.display()))
+            // Keep the native error in the chain: when the fallback also
+            // fails, "why the native parser gave up" is the diagnostic
+            // that matters.
+            render_via_rmscene(rm_path, cache_path).with_context(|| {
+                format!(
+                    "native parser failed ({e}) and rmscene fallback failed for {}",
+                    rm_path.display()
+                )
+            })
         }
     }
+}
+
+/// Clear cached SVGs rendered by an older parser/renderer. Cached pages
+/// are otherwise only re-rendered when the file is missing, which would
+/// pin every already-viewed page to the old (possibly broken) output.
+fn ensure_cache_version(cache_dir: &Path) -> Result<()> {
+    let marker = cache_dir.join(".render-version");
+    let current = RENDER_VERSION.to_string();
+    if let Ok(stored) = std::fs::read_to_string(&marker) {
+        if stored.trim() == current {
+            return Ok(());
+        }
+    }
+    for entry in std::fs::read_dir(cache_dir)
+        .with_context(|| format!("reading cache dir {}", cache_dir.display()))?
+    {
+        let path = entry?.path();
+        if path.extension().is_some_and(|e| e == "svg") {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("removing stale cache {}", path.display()))?;
+        }
+    }
+    std::fs::write(&marker, &current)
+        .with_context(|| format!("writing {}", marker.display()))?;
+    Ok(())
 }
 
 fn render_via_rmscene(rm_path: &Path, cache_path: &Path) -> Result<()> {
@@ -437,13 +525,18 @@ fn find_rm_to_svg_script() -> Result<std::path::PathBuf> {
             return Ok(beside);
         }
     }
-    // 2. In the source tree's scripts/ directory (dev mode)
+    // 2. Installed by the .deb package
+    let installed = Path::new("/usr/share/rmsync/rm_to_svg.py");
+    if installed.exists() {
+        return Ok(installed.to_path_buf());
+    }
+    // 3. In the source tree's scripts/ directory (dev mode)
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let dev = manifest_dir.join("scripts").join("rm_to_svg.py");
     if dev.exists() {
         return Ok(dev);
     }
-    // 3. In PATH
+    // 4. In PATH
     let which = std::process::Command::new("which")
         .arg("rm_to_svg.py")
         .output();
@@ -590,5 +683,41 @@ mod tests {
     #[test]
     fn inter_page_spacing_matches_constant() {
         assert_eq!(INTER_PAGE_SPACING, 16);
+    }
+
+    #[test]
+    fn cache_version_marker_is_written_on_first_use() {
+        let td = tempfile::tempdir().unwrap();
+        ensure_cache_version(td.path()).unwrap();
+        let stored = std::fs::read_to_string(td.path().join(".render-version")).unwrap();
+        assert_eq!(stored, RENDER_VERSION.to_string());
+    }
+
+    #[test]
+    fn stale_cache_svgs_are_cleared_on_version_bump() {
+        let td = tempfile::tempdir().unwrap();
+        // A cache from an older build: no marker (or an old one), plus
+        // rendered pages and the unrelated state files we must not touch.
+        std::fs::write(td.path().join("abc_p1.svg"), "old render").unwrap();
+        std::fs::write(td.path().join(".render-version"), "1").unwrap();
+        std::fs::write(td.path().join("notes.txt"), "keep me").unwrap();
+
+        ensure_cache_version(td.path()).unwrap();
+
+        assert!(!td.path().join("abc_p1.svg").exists(), "stale SVG kept");
+        assert!(td.path().join("notes.txt").exists(), "non-SVG removed");
+        let stored = std::fs::read_to_string(td.path().join(".render-version")).unwrap();
+        assert_eq!(stored, RENDER_VERSION.to_string());
+    }
+
+    #[test]
+    fn current_cache_is_left_alone() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::write(td.path().join(".render-version"), RENDER_VERSION.to_string()).unwrap();
+        std::fs::write(td.path().join("abc_p1.svg"), "current render").unwrap();
+
+        ensure_cache_version(td.path()).unwrap();
+
+        assert!(td.path().join("abc_p1.svg").exists());
     }
 }

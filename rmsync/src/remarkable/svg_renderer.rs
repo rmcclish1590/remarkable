@@ -5,36 +5,65 @@
 //! 1404×1872 viewport — or uses negative coordinates from panning — is
 //! always fully visible. Eraser strokes are dropped.
 
-use crate::remarkable::rm_parser::{PenColor, PenType, RmPage, RmStroke};
+use crate::remarkable::rm_parser::{
+    PenColor, PenType, RmPage, RmStroke, RmText, RmTextSpan, TextStyle,
+};
 use anyhow::{Context, Result};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// Version of the rendered-SVG output format. The viewer stamps its cache
+/// directory with this and clears cached SVGs on mismatch, so bump it
+/// whenever a parser or renderer change alters what pages look like —
+/// otherwise fixes never reach pages that were already cached.
+pub const RENDER_VERSION: u32 = 2;
 
 const DEFAULT_W: f32 = 1404.0;
 const DEFAULT_H: f32 = 1872.0;
 const HIGHLIGHTER_OPACITY: f32 = 0.3;
 const PADDING: f32 = 20.0;
 
-pub fn render_page_to_svg(page: &RmPage) -> String {
-    let (min_x, min_y, max_x, max_y) = page.bounding_box();
-    let has_strokes = page.total_strokes() > 0;
+/// Typed-text layout approximation. The tablet renders text with its own
+/// typography; we approximate with generic families and an average glyph
+/// width so pages are readable, not typographically identical.
+const TEXT_LINE_HEIGHT: f32 = 1.4;
+const TEXT_GLYPH_WIDTH: f32 = 0.5; // fraction of font size, for wrapping
+const TEXT_SIZE_PLAIN: f32 = 32.0;
+const TEXT_SIZE_HEADING: f32 = 48.0;
 
-    // Use the bounding box of all strokes (padded), falling back to
-    // the default reMarkable viewport for blank pages.
-    let (vb_x, vb_y, vb_w, vb_h) = if has_strokes {
-        let x = min_x - PADDING;
-        let y = min_y - PADDING;
-        let w = (max_x - min_x) + 2.0 * PADDING;
-        let h = (max_y - min_y) + 2.0 * PADDING;
-        // Ensure minimum viewport matches the device page when content
-        // fits within it, so blank margins look natural.
-        (
-            x.min(0.0),
-            y.min(0.0),
-            w.max(DEFAULT_W - x.min(0.0)),
-            h.max(DEFAULT_H - y.min(0.0)),
-        )
+pub fn render_page_to_svg(page: &RmPage) -> String {
+    let text_layout = page.text.as_ref().map(layout_text);
+
+    // Use the bounding box of all content (padded), falling back to the
+    // default reMarkable viewport for blank pages.
+    let mut bounds: Option<(f32, f32, f32, f32)> = if page.total_strokes() > 0 {
+        Some(page.bounding_box())
+    } else {
+        None
+    };
+    if let Some(layout) = &text_layout {
+        bounds = Some(match bounds {
+            Some((ax0, ay0, ax1, ay1)) => {
+                let (bx0, by0, bx1, by1) = layout.extent;
+                (ax0.min(bx0), ay0.min(by0), ax1.max(bx1), ay1.max(by1))
+            }
+            None => layout.extent,
+        });
+    }
+
+    // The viewport is the union of the device page (0,0)–(1404,1872) and
+    // the padded content box, so content fitting the page keeps natural
+    // margins while oversized content stays fully visible on every edge.
+    // (Clamping only the origin and reusing the padded width/height, as an
+    // earlier version did, silently clipped the bottom of any page whose
+    // content starts below the top margin and runs past the page height.)
+    let (vb_x, vb_y, vb_w, vb_h) = if let Some((min_x, min_y, max_x, max_y)) = bounds {
+        let x0 = (min_x - PADDING).min(0.0);
+        let y0 = (min_y - PADDING).min(0.0);
+        let x1 = (max_x + PADDING).max(DEFAULT_W);
+        let y1 = (max_y + PADDING).max(DEFAULT_H);
+        (x0, y0, x1 - x0, y1 - y0)
     } else {
         (0.0, 0.0, DEFAULT_W, DEFAULT_H)
     };
@@ -60,7 +89,216 @@ pub fn render_page_to_svg(page: &RmPage) -> String {
         }
         out.push_str("</g>");
     }
+    if let Some(layout) = &text_layout {
+        render_text(&mut out, layout);
+    }
     out.push_str("</svg>");
+    out
+}
+
+/// A wrapped line of typed text, ready to emit.
+struct TextLine {
+    x: f32,
+    baseline: f32,
+    size: f32,
+    /// Whole-paragraph bold (Heading and Bold paragraph styles).
+    bold: bool,
+    spans: Vec<RmTextSpan>,
+}
+
+struct TextLayout {
+    lines: Vec<TextLine>,
+    /// (min_x, min_y, max_x, max_y) the text occupies.
+    extent: (f32, f32, f32, f32),
+}
+
+fn style_metrics(style: TextStyle) -> (f32, bool, Option<&'static str>, f32) {
+    // (font size, paragraph bold, list prefix, indent)
+    match style {
+        TextStyle::Plain => (TEXT_SIZE_PLAIN, false, None, 0.0),
+        TextStyle::Heading => (TEXT_SIZE_HEADING, true, None, 0.0),
+        TextStyle::Bold => (TEXT_SIZE_PLAIN, true, None, 0.0),
+        TextStyle::Bullet => (TEXT_SIZE_PLAIN, false, Some("\u{2022} "), 0.0),
+        TextStyle::Bullet2 => (TEXT_SIZE_PLAIN, false, Some("\u{2022} "), TEXT_SIZE_PLAIN),
+        TextStyle::Checkbox => (TEXT_SIZE_PLAIN, false, Some("\u{2610} "), 0.0),
+        TextStyle::CheckboxChecked => (TEXT_SIZE_PLAIN, false, Some("\u{2611} "), 0.0),
+    }
+}
+
+/// Wrap paragraphs into lines. Wrapping is an estimate from an average
+/// glyph width — the goal is that long paragraphs stay on the page, not
+/// that line breaks land exactly where the tablet puts them.
+fn layout_text(text: &RmText) -> TextLayout {
+    let mut lines = Vec::new();
+    let mut cursor = text.pos_y as f32;
+    for paragraph in &text.paragraphs {
+        let (size, bold, prefix, indent) = style_metrics(paragraph.style);
+        let advance = size * TEXT_LINE_HEIGHT;
+        let budget =
+            (((text.width - indent) / (size * TEXT_GLYPH_WIDTH)) as usize).max(8);
+
+        let mut spans: Vec<RmTextSpan> = Vec::new();
+        if let Some(prefix) = prefix {
+            spans.push(RmTextSpan {
+                text: prefix.to_string(),
+                bold: false,
+                italic: false,
+            });
+        }
+        spans.extend(paragraph.spans.iter().cloned());
+
+        let wrapped = wrap_spans(&spans, budget);
+        if wrapped.is_empty() {
+            // An empty paragraph is a blank line.
+            cursor += advance;
+            continue;
+        }
+        for line_spans in wrapped {
+            cursor += advance;
+            lines.push(TextLine {
+                x: text.pos_x as f32 + indent,
+                baseline: cursor - size * 0.3,
+                size,
+                bold,
+                spans: line_spans,
+            });
+        }
+    }
+
+    let min_x = text.pos_x as f32;
+    let min_y = text.pos_y as f32;
+    let max_x = min_x + text.width.max(1.0);
+    let max_y = cursor.max(min_y + 1.0);
+    TextLayout {
+        lines,
+        extent: (min_x, min_y, max_x, max_y),
+    }
+}
+
+/// Greedy word wrap over formatted spans, breaking at spaces where
+/// possible and hard-breaking words longer than a whole line.
+fn wrap_spans(spans: &[RmTextSpan], budget: usize) -> Vec<Vec<RmTextSpan>> {
+    // Split into (word, formatting) tokens; a space token marks each gap.
+    let mut tokens: Vec<(String, bool, bool)> = Vec::new();
+    for span in spans {
+        for piece in span.text.split_inclusive(' ') {
+            let word = piece.trim_end_matches(' ');
+            if !word.is_empty() {
+                tokens.push((word.to_string(), span.bold, span.italic));
+            }
+            if piece.ends_with(' ') {
+                tokens.push((" ".to_string(), span.bold, span.italic));
+            }
+        }
+    }
+
+    let mut lines: Vec<Vec<RmTextSpan>> = Vec::new();
+    let mut current: Vec<RmTextSpan> = Vec::new();
+    let mut current_len = 0usize;
+
+    let push = |lines: &mut Vec<Vec<RmTextSpan>>,
+                    current: &mut Vec<RmTextSpan>,
+                    current_len: &mut usize| {
+        if !current.is_empty() {
+            lines.push(std::mem::take(current));
+        }
+        *current_len = 0;
+    };
+
+    for (word, bold, italic) in tokens {
+        let is_space = word == " ";
+        let mut word = word;
+        if is_space && current_len == 0 {
+            continue; // never start a line with the wrap gap
+        }
+        let mut len = word.chars().count();
+        while !is_space && current_len + len > budget {
+            if current_len == 0 {
+                // A single word longer than the line: hard-break it.
+                let head: String = word.chars().take(budget).collect();
+                let tail: String = word.chars().skip(budget).collect();
+                append_span(&mut current, head, bold, italic);
+                push(&mut lines, &mut current, &mut current_len);
+                word = tail;
+                len = word.chars().count();
+                if len == 0 {
+                    break;
+                }
+            } else {
+                push(&mut lines, &mut current, &mut current_len);
+            }
+        }
+        if word.is_empty() || (is_space && current_len == 0) {
+            continue;
+        }
+        append_span(&mut current, word.clone(), bold, italic);
+        current_len += len;
+    }
+    if !current.is_empty() {
+        // Trailing spaces don't earn a line of their own.
+        if current.iter().any(|s| !s.text.trim().is_empty()) {
+            lines.push(current);
+        }
+    }
+    lines
+}
+
+fn append_span(line: &mut Vec<RmTextSpan>, text: String, bold: bool, italic: bool) {
+    match line.last_mut() {
+        Some(s) if s.bold == bold && s.italic == italic => s.text.push_str(&text),
+        _ => line.push(RmTextSpan { text, bold, italic }),
+    }
+}
+
+fn render_text(out: &mut String, layout: &TextLayout) {
+    if layout.lines.is_empty() {
+        return;
+    }
+    out.push_str(r#"<g id="text">"#);
+    for line in &layout.lines {
+        write!(
+            out,
+            r##"<text x="{:.2}" y="{:.2}" font-family="sans-serif" font-size="{:.1}" fill="#000000""##,
+            line.x, line.baseline, line.size
+        )
+        .unwrap();
+        if line.bold {
+            out.push_str(r#" font-weight="bold""#);
+        }
+        out.push('>');
+        for span in &line.spans {
+            let needs_tspan = (span.bold && !line.bold) || span.italic;
+            if needs_tspan {
+                out.push_str("<tspan");
+                if span.bold && !line.bold {
+                    out.push_str(r#" font-weight="bold""#);
+                }
+                if span.italic {
+                    out.push_str(r#" font-style="italic""#);
+                }
+                out.push('>');
+                out.push_str(&xml_escape(&span.text));
+                out.push_str("</tspan>");
+            } else {
+                out.push_str(&xml_escape(&span.text));
+            }
+        }
+        out.push_str("</text>");
+    }
+    out.push_str("</g>");
+}
+
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
     out
 }
 
@@ -172,7 +410,7 @@ fn pen_color_to_svg(color: &PenColor) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::remarkable::rm_parser::{RmLayer, RmPoint, RmStroke};
+    use crate::remarkable::rm_parser::{RmLayer, RmParagraph, RmPoint, RmStroke};
     use tempfile::tempdir;
 
     fn pt(x: f32, y: f32) -> RmPoint {
@@ -193,6 +431,7 @@ mod tests {
                 .into_iter()
                 .map(|strokes| RmLayer { strokes })
                 .collect(),
+            text: None,
         }
     }
 
@@ -334,6 +573,155 @@ mod tests {
         let l0 = svg.find(r#"<g id="layer-0">"#).expect("layer-0 group");
         let l1 = svg.find(r#"<g id="layer-1">"#).expect("layer-1 group");
         assert!(l0 < l1, "layer-0 must appear before layer-1");
+    }
+
+    fn text_page(paragraphs: Vec<RmParagraph>) -> RmPage {
+        RmPage {
+            version: 6,
+            layers: vec![],
+            text: Some(RmText {
+                paragraphs,
+                pos_x: -468.0,
+                pos_y: 234.0,
+                width: 936.0,
+            }),
+        }
+    }
+
+    fn span(text: &str) -> RmTextSpan {
+        RmTextSpan {
+            text: text.to_string(),
+            bold: false,
+            italic: false,
+        }
+    }
+
+    #[test]
+    fn typed_text_renders_as_text_elements() {
+        let page = text_page(vec![
+            RmParagraph {
+                style: TextStyle::Heading,
+                spans: vec![span("My Notes")],
+            },
+            RmParagraph {
+                style: TextStyle::Plain,
+                spans: vec![span("hello world")],
+            },
+        ]);
+        let svg = render_page_to_svg(&page);
+        assert!(svg.contains(r#"<g id="text">"#));
+        assert!(svg.contains("My Notes"));
+        assert!(svg.contains("hello world"));
+        // Headings are larger and bold.
+        assert!(svg.contains(r##"font-size="48.0" fill="#000000" font-weight="bold""##));
+        // The viewport must cover the text block, not collapse to 0×0.
+        assert!(!svg.contains(r#"viewBox="0.0 0.0 0.0 0.0""#));
+    }
+
+    #[test]
+    fn text_is_xml_escaped() {
+        let page = text_page(vec![RmParagraph {
+            style: TextStyle::Plain,
+            spans: vec![span("a<b & c>\"d\"")],
+        }]);
+        let svg = render_page_to_svg(&page);
+        assert!(svg.contains("a&lt;b &amp; c&gt;&quot;d&quot;"));
+        assert!(!svg.contains("a<b"));
+    }
+
+    #[test]
+    fn long_paragraph_wraps_into_multiple_lines() {
+        let long = "word ".repeat(100);
+        let page = text_page(vec![RmParagraph {
+            style: TextStyle::Plain,
+            spans: vec![span(&long)],
+        }]);
+        let svg = render_page_to_svg(&page);
+        let lines = svg.matches("<text ").count();
+        assert!(lines > 5, "500 chars at ~58 chars/line: got {lines} lines");
+    }
+
+    #[test]
+    fn bullet_paragraphs_get_a_marker_prefix() {
+        let page = text_page(vec![RmParagraph {
+            style: TextStyle::Bullet,
+            spans: vec![span("item")],
+        }]);
+        let svg = render_page_to_svg(&page);
+        assert!(svg.contains("\u{2022} item"));
+    }
+
+    #[test]
+    fn inline_bold_and_italic_become_tspans() {
+        let page = text_page(vec![RmParagraph {
+            style: TextStyle::Plain,
+            spans: vec![
+                span("plain "),
+                RmTextSpan {
+                    text: "bold".to_string(),
+                    bold: true,
+                    italic: false,
+                },
+                RmTextSpan {
+                    text: " ital".to_string(),
+                    bold: false,
+                    italic: true,
+                },
+            ],
+        }]);
+        let svg = render_page_to_svg(&page);
+        assert!(svg.contains(r#"<tspan font-weight="bold">bold</tspan>"#));
+        assert!(svg.contains(r#"<tspan font-style="italic"> ital</tspan>"#));
+    }
+
+    #[test]
+    fn text_and_strokes_render_together() {
+        let mut page = page_with(vec![vec![stroke(
+            PenType::Fineliner,
+            PenColor::Black,
+            vec![pt(10.0, 20.0), pt(30.0, 40.0)],
+        )]]);
+        page.text = Some(RmText {
+            paragraphs: vec![RmParagraph {
+                style: TextStyle::Plain,
+                spans: vec![span("annotation")],
+            }],
+            pos_x: -468.0,
+            pos_y: 234.0,
+            width: 936.0,
+        });
+        let svg = render_page_to_svg(&page);
+        assert!(svg.contains("<polyline"));
+        assert!(svg.contains("annotation"));
+        // viewBox must cover the text block's left edge (x = -468).
+        assert!(svg.contains(r#"viewBox="-488.0"#), "svg was: {}", &svg[..120]);
+    }
+
+    #[test]
+    fn tall_content_starting_below_top_margin_is_not_bottom_clipped() {
+        // Regression: content from y=234 down to y=4000 used to get a
+        // viewBox whose bottom sat above the lowest content because the
+        // origin was clamped to 0 without re-extending the height.
+        let page = page_with(vec![vec![stroke(
+            PenType::Fineliner,
+            PenColor::Black,
+            vec![pt(100.0, 234.0), pt(100.0, 4000.0)],
+        )]]);
+        let svg = render_page_to_svg(&page);
+        // Bottom edge must reach max_y + padding: 0 → 4020 on the y axis.
+        assert!(
+            svg.contains(r#"viewBox="0.0 0.0 1404.0 4020.0""#),
+            "svg was: {}",
+            &svg[..130]
+        );
+    }
+
+    #[test]
+    fn wrap_spans_hard_breaks_oversized_words() {
+        let lines = wrap_spans(&[span(&"x".repeat(25))], 10);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0][0].text.len(), 10);
+        assert_eq!(lines[2][0].text.len(), 5);
     }
 
     #[test]

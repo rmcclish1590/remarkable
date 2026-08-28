@@ -85,4 +85,5 @@ assets = [
     ["assets/rmsync.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
     ["assets/rmsync-48.png", "usr/share/icons/hicolor/48x48/apps/rmsync.png", "644"],
     ["assets/99-remarkable.rules", "etc/udev/rules.d/", "644"],
+    ["scripts/rm_to_svg.py", "usr/share/rmsync/", "755"],
 ]

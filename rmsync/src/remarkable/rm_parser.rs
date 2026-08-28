@@ -35,6 +35,61 @@ const FLAT_VERSIONS: [u32; 2] = [3, 5];
 pub struct RmPage {
     pub version: u32,
     pub layers: Vec<RmLayer>,
+    /// Typed text entered with the on-screen keyboard or a Type Folio.
+    /// Only v6 files carry it; the flat formats predate text support.
+    pub text: Option<RmText>,
+}
+
+/// A page's typed-text block: paragraphs in document order plus the
+/// position and wrapping width the tablet stores alongside them.
+/// Coordinates share the stroke coordinate space (x centred on 0).
+#[derive(Debug, Clone, Default)]
+pub struct RmText {
+    pub paragraphs: Vec<RmParagraph>,
+    pub pos_x: f64,
+    pub pos_y: f64,
+    pub width: f32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RmParagraph {
+    pub style: TextStyle,
+    pub spans: Vec<RmTextSpan>,
+}
+
+/// A run of characters sharing the same inline formatting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RmTextSpan {
+    pub text: String,
+    pub bold: bool,
+    pub italic: bool,
+}
+
+/// Per-paragraph style, from the tablet's paragraph-format codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextStyle {
+    #[default]
+    Plain,
+    Heading,
+    Bold,
+    Bullet,
+    Bullet2,
+    Checkbox,
+    CheckboxChecked,
+}
+
+impl RmText {
+    pub fn char_count(&self) -> usize {
+        self.paragraphs
+            .iter()
+            .flat_map(|p| p.spans.iter())
+            .map(|s| s.text.chars().count())
+            .sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.char_count() == 0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -108,8 +163,12 @@ pub fn parse_rm_file(input: &[u8]) -> Result<RmPage, RmParseError> {
 
     if version == V6_VERSION {
         // v6 blocks begin immediately after the header, with no padding.
-        let layers = parse_v6_blocks(&input[HEADER_LEN..]);
-        return Ok(RmPage { version, layers });
+        let (layers, text) = parse_v6_blocks(&input[HEADER_LEN..]);
+        return Ok(RmPage {
+            version,
+            layers,
+            text,
+        });
     }
 
     if !FLAT_VERSIONS.contains(&version) {
@@ -150,7 +209,11 @@ fn parse_flat_body(
     let (_, layers) = count(parse_layer, num_layers)(rest)
         .map_err(|_| RmParseError::UnexpectedEof(offset_at_layers))?;
 
-    Ok(RmPage { version, layers })
+    Ok(RmPage {
+        version,
+        layers,
+        text: None,
+    })
 }
 
 pub fn parse_rm_from_path(path: &Path) -> Result<RmPage, RmParseError> {
@@ -192,7 +255,7 @@ impl RmPage {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.total_strokes() == 0
+        self.total_strokes() == 0 && self.text.as_ref().is_none_or(|t| t.is_empty())
     }
 
     pub fn total_strokes(&self) -> usize {
