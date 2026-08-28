@@ -85,7 +85,7 @@ cd rmsync
 ./scripts/build-deb.sh
 ```
 
-The script builds the release binary, runs the full test suite, and produces the package at `rmsync/target/debian/rmsync_<version>_amd64.deb`.
+The script builds the release binary, runs the full test suite, and produces the package at `rmsync/target/debian/rmsync_<version>_amd64.deb`. It then copies the package into a temp directory that apt's sandboxed `_apt` user can read, and prints a ready-to-run install command for that copy — packages left under your home directory trigger the `Permission denied` notice described above.
 
 ## Running the application
 
