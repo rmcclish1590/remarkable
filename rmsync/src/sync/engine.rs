@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 
 use crate::sync::scanner::{LocalDocumentSnapshot, LocalManifest, RemoteDocumentSnapshot, RemoteManifest};
-use crate::sync::state_db::{StateDb, SyncFileState};
+use crate::sync::state_db::{StateDb, SyncFileState, SyncStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncActionType {
@@ -205,6 +205,66 @@ fn classify(
         action_type,
         priority,
     }
+}
+
+/// Baselines to record for documents both sides already agree on.
+///
+/// A `Skip` leaves no state row behind, so the next one-sided change to a
+/// matched document would be diffed against nothing and look like a conflict.
+/// Recording the agreed hash is what lets an existing local file be recognised
+/// by UUID and updated in place. Also repairs baselines left stale by an
+/// earlier hashing scheme.
+pub fn matched_baselines(
+    local: &LocalManifest,
+    remote: &RemoteManifest,
+    synced: &[SyncFileState],
+) -> Vec<SyncFileState> {
+    let remote_map: HashMap<&str, &RemoteDocumentSnapshot> =
+        remote.documents.iter().map(|d| (d.uuid.as_str(), d)).collect();
+    let synced_map: HashMap<&str, &SyncFileState> =
+        synced.iter().map(|s| (s.uuid.as_str(), s)).collect();
+    let now = now_secs();
+
+    let mut updates = Vec::new();
+    for l in &local.documents {
+        let Some(r) = remote_map.get(l.uuid.as_str()) else { continue };
+        if l.content_hash != r.content_hash {
+            continue;
+        }
+        let existing = synced_map.get(l.uuid.as_str()).copied();
+        if existing.is_some_and(|s| s.synced_hash.as_deref() == Some(l.content_hash.as_str())) {
+            continue;
+        }
+        let mut state = existing.cloned().unwrap_or_else(|| SyncFileState {
+            uuid: l.uuid.clone(),
+            visible_name: String::new(),
+            parent_uuid: String::new(),
+            doc_type: String::new(),
+            local_hash: None,
+            remote_hash: None,
+            synced_hash: None,
+            local_mtime: None,
+            remote_mtime: None,
+            synced_mtime: None,
+            last_sync_at: None,
+            sync_status: SyncStatus::Synced,
+            conflict_info: None,
+        });
+        state.visible_name = r.metadata.visible_name.clone();
+        state.parent_uuid = r.metadata.parent.clone();
+        state.doc_type = r.metadata.doc_type.clone();
+        state.local_hash = Some(l.content_hash.clone());
+        state.remote_hash = Some(r.content_hash.clone());
+        state.synced_hash = Some(l.content_hash.clone());
+        state.local_mtime = Some(l.mtime);
+        state.remote_mtime = Some(r.mtime);
+        state.synced_mtime = Some(l.mtime.max(r.mtime));
+        state.last_sync_at = Some(now);
+        state.sync_status = SyncStatus::Synced;
+        state.conflict_info = None;
+        updates.push(state);
+    }
+    updates
 }
 
 fn derive_name_and_priority(
@@ -552,6 +612,27 @@ impl SyncOrchestrator {
                 return Ok(self.finalise(start, report, &callback).await);
             }
         };
+
+        // Adopt documents both sides already agree on, so they are matched by
+        // UUID from now on instead of being re-diffed against no baseline.
+        match self.db.get_all_states() {
+            Ok(states) => {
+                for state in matched_baselines(&local, &remote, &states) {
+                    tracing::info!(
+                        uuid = %state.uuid,
+                        name = %state.visible_name,
+                        "matched existing local document by uuid; recording baseline"
+                    );
+                    if let Err(e) = self.db.upsert_state(&state) {
+                        tracing::warn!(uuid = %state.uuid, error = format!("{e:#}"), "recording baseline failed");
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = format!("{e:#}"), "reading sync state failed"),
+        }
+        for a in &plan.actions {
+            tracing::debug!(uuid = %a.uuid, name = %a.visible_name, action = ?a.action_type, "sync decision");
+        }
 
         // 5. Resolve conflicts
         if plan.has_conflicts() && !self.cancel.is_cancelled() {
@@ -1118,5 +1199,112 @@ mod tests {
         };
         let plan = compute_sync_plan(&local, &rem, &db).unwrap();
         assert_eq!(plan.total_pull, 1);
+    }
+
+    // --- matching existing local documents by UUID (MCC-101) ---
+
+    fn manifests(
+        l: Vec<LocalDocumentSnapshot>,
+        r: Vec<RemoteDocumentSnapshot>,
+    ) -> (LocalManifest, RemoteManifest) {
+        (
+            LocalManifest {
+                documents: l,
+                scanned_at: 0,
+                total_documents: 0,
+                total_size_bytes: 0,
+                sync_dir: PathBuf::from("/tmp"),
+            },
+            RemoteManifest {
+                documents: r,
+                scanned_at: 0,
+                total_documents: 0,
+                total_size_bytes: 0,
+            },
+        )
+    }
+
+    #[test]
+    fn first_sync_of_existing_document_skips_and_records_baseline() {
+        let (l, r) = manifests(
+            vec![local("a", "h1", "DocumentType")],
+            vec![remote("a", "h1", "DocumentType")],
+        );
+        let plan = compute_sync_plan_from_parts(&l, &r, &[]);
+        assert_eq!(plan.total_skip, 1);
+        assert_eq!(plan.total_conflict + plan.total_pull + plan.total_push, 0);
+
+        let baselines = matched_baselines(&l, &r, &[]);
+        assert_eq!(baselines.len(), 1);
+        assert_eq!(baselines[0].uuid, "a");
+        assert_eq!(baselines[0].synced_hash.as_deref(), Some("h1"));
+    }
+
+    #[test]
+    fn unchanged_resync_creates_nothing() {
+        let (l, r) = manifests(
+            vec![local("a", "h1", "DocumentType")],
+            vec![remote("a", "h1", "DocumentType")],
+        );
+        let states = [synced("a", "h1", "DocumentType")];
+        let plan = compute_sync_plan_from_parts(&l, &r, &states);
+        assert_eq!(plan.total_skip, 1);
+        assert_eq!(plan.total_conflict + plan.total_pull + plan.total_push, 0);
+        assert!(matched_baselines(&l, &r, &states).is_empty());
+    }
+
+    #[test]
+    fn device_edit_after_baseline_pulls_in_place() {
+        // First sync adopted the document; the device then changed it.
+        let (l, r) = manifests(
+            vec![local("a", "h1", "DocumentType")],
+            vec![remote("a", "h2", "DocumentType")],
+        );
+        let states = [synced("a", "h1", "DocumentType")];
+        let plan = compute_sync_plan_from_parts(&l, &r, &states);
+        assert_eq!(plan.total_pull, 1);
+        assert_eq!(plan.total_conflict, 0);
+        assert!(matched_baselines(&l, &r, &states).is_empty());
+    }
+
+    #[test]
+    fn device_edit_right_after_adoption_is_not_a_conflict() {
+        let (l, r) = manifests(
+            vec![local("a", "h1", "DocumentType")],
+            vec![remote("a", "h1", "DocumentType")],
+        );
+        let adopted = matched_baselines(&l, &r, &[]);
+        let (l2, r2) = manifests(
+            vec![local("a", "h1", "DocumentType")],
+            vec![remote("a", "h2", "DocumentType")],
+        );
+        let plan = compute_sync_plan_from_parts(&l2, &r2, &adopted);
+        assert_eq!(plan.total_pull, 1);
+        assert_eq!(plan.total_conflict, 0);
+    }
+
+    #[test]
+    fn stale_baseline_is_repaired_when_sides_agree() {
+        let (l, r) = manifests(
+            vec![local("a", "new", "DocumentType")],
+            vec![remote("a", "new", "DocumentType")],
+        );
+        let fixed = matched_baselines(&l, &r, &[synced("a", "old", "DocumentType")]);
+        assert_eq!(fixed.len(), 1);
+        assert_eq!(fixed[0].synced_hash.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn renamed_on_device_keeps_the_same_uuid_entry() {
+        let (l, mut r) = manifests(
+            vec![local("a", "h1", "DocumentType")],
+            vec![remote("a", "h1", "DocumentType")],
+        );
+        r.documents[0].metadata = meta("Renamed", "DocumentType");
+        let states = [synced("a", "h1", "DocumentType")];
+        // Same UUID, same content: one skip, no second document.
+        let plan = compute_sync_plan_from_parts(&l, &r, &states);
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.total_skip, 1);
     }
 }
