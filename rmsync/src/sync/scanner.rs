@@ -249,33 +249,65 @@ fn remote_path_to_relative(path: &str) -> &str {
         .unwrap_or(path)
 }
 
+/// Whether a remote entry is one `pull_document` mirrors into `raw/`.
+///
+/// The remote hash must cover exactly the files that land locally, or the two
+/// sides can never agree: the tablet keeps directories (`<uuid>.thumbnails`)
+/// and dotfiles that a pull deliberately skips.
+pub(crate) fn is_mirrored_remote(f: &RemoteFileInfo) -> bool {
+    !f.is_dir
+        && remote_path_to_relative(&f.path)
+            .split('/')
+            .all(crate::sync::transfer::is_safe_component)
+}
+
 async fn compute_remote_hash(
     conn: &DeviceConnection,
     file_list: &[RemoteFileInfo],
 ) -> Result<String> {
-    let mut sorted: Vec<&RemoteFileInfo> = file_list.iter().collect();
-    sorted.sort_by(|a, b| {
-        remote_path_to_relative(&a.path).cmp(remote_path_to_relative(&b.path))
-    });
-
-    let mut hasher = Sha256::new();
-    for f in sorted {
-        hasher.update(remote_path_to_relative(&f.path).as_bytes());
-        hasher.update([0u8]);
-        if f.is_dir {
-            continue;
-        }
-        if f.size <= FULL_HASH_THRESHOLD {
+    let mut fingerprints = Vec::with_capacity(file_list.len());
+    for f in file_list.iter().filter(|f| is_mirrored_remote(f)) {
+        let fingerprint = if f.size <= FULL_HASH_THRESHOLD {
             match conn.read_file(&f.path).await {
-                Ok(bytes) => hasher.update(&bytes),
-                Err(_) => hasher.update(format!("stat:{}:{}", f.size, f.mtime).as_bytes()),
+                Ok(bytes) => FileFingerprint::Content(bytes),
+                Err(_) => FileFingerprint::Stat { size: f.size, mtime: f.mtime },
             }
         } else {
-            hasher.update(format!("stat:{}:{}", f.size, f.mtime).as_bytes());
+            FileFingerprint::Stat { size: f.size, mtime: f.mtime }
+        };
+        fingerprints.push((remote_path_to_relative(&f.path).to_string(), fingerprint));
+    }
+    Ok(combine_fingerprints(fingerprints))
+}
+
+/// What one file contributes to a document hash.
+pub(crate) enum FileFingerprint {
+    Content(Vec<u8>),
+    /// Cheap proxy for files over `FULL_HASH_THRESHOLD`.
+    Stat { size: u64, mtime: u64 },
+}
+
+/// The single hash routine shared by the local and remote scanners.
+///
+/// Entries are keyed by path relative to `raw/` and sorted as plain strings.
+/// Sorting `Path`s instead compares component-wise, which orders
+/// `uuid/page.rm` before `uuid.metadata` — the opposite of string order — so
+/// the two sides must never sort differently.
+pub(crate) fn combine_fingerprints(mut files: Vec<(String, FileFingerprint)>) -> String {
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut hasher = Sha256::new();
+    for (rel, fingerprint) in &files {
+        hasher.update(rel.as_bytes());
+        hasher.update([0u8]);
+        match fingerprint {
+            FileFingerprint::Content(bytes) => hasher.update(bytes),
+            FileFingerprint::Stat { size, mtime } => {
+                hasher.update(format!("stat:{size}:{mtime}").as_bytes())
+            }
         }
         hasher.update([0u8]);
     }
-    Ok(hex::encode(hasher.finalize()))
+    hex::encode(hasher.finalize())
 }
 
 fn now_unix() -> u64 {
@@ -457,30 +489,20 @@ pub fn compute_local_hash(
     files: &[LocalFileInfo],
     raw_dir: &Path,
 ) -> Result<String> {
-    let mut sorted: Vec<&LocalFileInfo> = files.iter().collect();
-    sorted.sort_by(|a, b| {
-        let ra = a.path.strip_prefix(raw_dir).unwrap_or(&a.path);
-        let rb = b.path.strip_prefix(raw_dir).unwrap_or(&b.path);
-        ra.cmp(rb)
-    });
-
-    let mut hasher = Sha256::new();
-    for f in sorted {
+    let mut fingerprints = Vec::with_capacity(files.len());
+    for f in files.iter().filter(|f| f.path.is_file()) {
         let rel = f.path.strip_prefix(raw_dir).unwrap_or(&f.path);
-        let rel_str = rel.to_string_lossy();
-        hasher.update(rel_str.as_bytes());
-        hasher.update([0u8]);
-        if f.size <= FULL_HASH_THRESHOLD {
+        let fingerprint = if f.size <= FULL_HASH_THRESHOLD {
             match std::fs::read(&f.path) {
-                Ok(bytes) => hasher.update(&bytes),
-                Err(_) => hasher.update(format!("stat:{}:{}", f.size, f.mtime).as_bytes()),
+                Ok(bytes) => FileFingerprint::Content(bytes),
+                Err(_) => FileFingerprint::Stat { size: f.size, mtime: f.mtime },
             }
         } else {
-            hasher.update(format!("stat:{}:{}", f.size, f.mtime).as_bytes());
-        }
-        hasher.update([0u8]);
+            FileFingerprint::Stat { size: f.size, mtime: f.mtime }
+        };
+        fingerprints.push((rel.to_string_lossy().into_owned(), fingerprint));
     }
-    Ok(hex::encode(hasher.finalize()))
+    Ok(combine_fingerprints(fingerprints))
 }
 
 pub fn classify_change(
@@ -895,5 +917,90 @@ mod tests {
     fn watch_paths_returns_raw() {
         let paths = get_watch_paths(Path::new("/sync"));
         assert_eq!(paths, vec![PathBuf::from("/sync/raw")]);
+    }
+
+    /// Build the remote-side hash the way `compute_remote_hash` does, from the
+    /// same bytes, over a listing that carries what a real tablet carries.
+    fn remote_hash_for(uuid: &str, files: &[(&str, &[u8])]) -> String {
+        let mut listing: Vec<RemoteFileInfo> = files
+            .iter()
+            .map(|(rel, bytes)| RemoteFileInfo {
+                name: rel.rsplit('/').next().unwrap().to_string(),
+                path: format!("{XOCHITL_PATH}/{rel}"),
+                size: bytes.len() as u64,
+                mtime: 1,
+                is_dir: false,
+            })
+            .collect();
+        // Entries a pull skips: a directory and a dotfile.
+        for (name, is_dir) in [(format!("{uuid}.thumbnails"), true), (".hidden".to_string(), false)] {
+            listing.push(RemoteFileInfo {
+                name: name.clone(),
+                path: format!("{XOCHITL_PATH}/{uuid}/{name}"),
+                size: 4096,
+                mtime: 1,
+                is_dir,
+            });
+        }
+        let fingerprints = listing
+            .iter()
+            .filter(|f| is_mirrored_remote(f))
+            .map(|f| {
+                let bytes = files
+                    .iter()
+                    .find(|(rel, _)| format!("{XOCHITL_PATH}/{rel}") == f.path)
+                    .unwrap()
+                    .1;
+                (
+                    remote_path_to_relative(&f.path).to_string(),
+                    FileFingerprint::Content(bytes.to_vec()),
+                )
+            })
+            .collect();
+        combine_fingerprints(fingerprints)
+    }
+
+    #[test]
+    fn local_and_remote_hash_agree_for_identical_document() {
+        let dir = tempdir().unwrap();
+        let raw = dir.path().join("raw");
+        fs::create_dir_all(&raw).unwrap();
+        write_doc(&raw, "abc", "Same", b"pagebytes");
+
+        let local = scan_local(dir.path()).unwrap().documents.remove(0);
+        // `uuid/p1.rm` sorts before `uuid.metadata` as a Path but after it as
+        // a string; this document exercises both orderings.
+        let remote = remote_hash_for(
+            "abc",
+            &[
+                ("abc.metadata", &fs::read(raw.join("abc.metadata")).unwrap()),
+                ("abc.content", &fs::read(raw.join("abc.content")).unwrap()),
+                ("abc/p1.rm", b"pagebytes"),
+            ],
+        );
+        assert_eq!(local.content_hash, remote);
+    }
+
+    #[test]
+    fn remote_hash_ignores_entries_pull_does_not_mirror() {
+        let base = [("abc.metadata", b"m".as_slice())];
+        let with_extras = remote_hash_for("abc", &base);
+        let plain = combine_fingerprints(vec![(
+            "abc.metadata".to_string(),
+            FileFingerprint::Content(b"m".to_vec()),
+        )]);
+        assert_eq!(with_extras, plain);
+    }
+
+    #[test]
+    fn local_hash_ignores_directories() {
+        let dir = tempdir().unwrap();
+        let raw = dir.path().join("raw");
+        fs::create_dir_all(&raw).unwrap();
+        write_doc(&raw, "abc", "Same", b"aaaa");
+        let before = scan_local(dir.path()).unwrap().documents[0].content_hash.clone();
+        fs::create_dir_all(raw.join("abc.thumbnails")).unwrap();
+        let after = scan_local(dir.path()).unwrap().documents[0].content_hash.clone();
+        assert_eq!(before, after);
     }
 }
