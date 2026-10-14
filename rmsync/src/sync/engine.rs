@@ -305,15 +305,24 @@ pub enum ConflictWinner {
     Remote,
 }
 
+/// Modified times closer together than this are treated as simultaneous.
+/// Covers filesystem timestamp granularity and sub-second clock drift; a tie
+/// goes to the device, the same side that wins identical timestamps.
+pub const TIMESTAMP_TOLERANCE_SECS: i64 = 2;
+
 #[derive(Debug, Clone)]
 pub struct ConflictResolution {
     pub uuid: String,
     pub visible_name: String,
     pub winner: ConflictWinner,
-    pub backup_uuid: String,
-    pub backup_name: String,
+    /// Where the overwritten version is kept, relative to
+    /// `<sync_dir>/.rmsync/backups/`. Deliberately outside `raw/`: a backup is
+    /// not a document, so it never shows up in the library or gets pushed.
+    pub backup_subdir: String,
     pub local_mtime: u64,
     pub remote_mtime: u64,
+    /// Device clock minus desktop clock, in seconds, used to compare the two.
+    pub clock_offset_secs: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -322,7 +331,7 @@ pub struct ConflictNotification {
     pub winner_source: String,
     pub winner_mtime: u64,
     pub loser_mtime: u64,
-    pub backup_name: String,
+    pub backup_location: String,
     pub time_difference_human: String,
 }
 
@@ -332,19 +341,20 @@ impl ConflictResolution {
             ConflictWinner::Local => ("local", self.local_mtime, self.remote_mtime),
             ConflictWinner::Remote => ("reMarkable", self.remote_mtime, self.local_mtime),
         };
+        let delta = (self.local_mtime as i64 - (self.remote_mtime as i64 - self.clock_offset_secs))
+            .unsigned_abs();
         ConflictNotification {
             document_name: self.visible_name.clone(),
             winner_source: winner_source.to_string(),
             winner_mtime,
             loser_mtime,
-            backup_name: self.backup_name.clone(),
-            time_difference_human: humanise_delta(winner_mtime, loser_mtime, winner_source),
+            backup_location: self.backup_subdir.clone(),
+            time_difference_human: humanise_delta(delta, winner_source),
         }
     }
 }
 
-fn humanise_delta(winner: u64, loser: u64, winner_source: &str) -> String {
-    let delta = winner.saturating_sub(loser);
+fn humanise_delta(delta: u64, winner_source: &str) -> String {
     let (value, unit) = if delta >= 86400 {
         (delta / 86400, "day")
     } else if delta >= 3600 {
@@ -358,27 +368,56 @@ fn humanise_delta(winner: u64, loser: u64, winner_source: &str) -> String {
     format!("{winner_source} was {value} {unit}{plural} newer")
 }
 
-/// Resolve a conflict action using last-write-wins (ties favour the device).
+/// Decide which side's modification is the more recent.
+///
+/// `clock_offset_secs` is the device clock minus the desktop clock. Modified
+/// times are Unix timestamps, so timezones cancel out; what does not cancel is
+/// the device's clock being set wrong (a tablet that has been off for weeks
+/// often is), so the device time is shifted onto the desktop clock before
+/// comparing. Differences within `TIMESTAMP_TOLERANCE_SECS` are a tie.
+pub fn pick_winner(local_mtime: u64, remote_mtime: u64, clock_offset_secs: i64) -> ConflictWinner {
+    let remote_on_local_clock = remote_mtime as i64 - clock_offset_secs;
+    if local_mtime as i64 - remote_on_local_clock > TIMESTAMP_TOLERANCE_SECS {
+        ConflictWinner::Local
+    } else {
+        ConflictWinner::Remote
+    }
+}
+
+/// Resolve a two-sided change: the most recently modified version wins and the
+/// other is backed up (never silently discarded, never turned into a second
+/// document).
 pub fn resolve_conflict(
     action: &SyncAction,
     local: &LocalDocumentSnapshot,
     remote: &RemoteDocumentSnapshot,
+    clock_offset_secs: i64,
 ) -> ConflictResolution {
-    let winner = if local.mtime > remote.mtime {
-        ConflictWinner::Local
-    } else {
-        ConflictWinner::Remote
+    let winner = pick_winner(local.mtime, remote.mtime, clock_offset_secs);
+    let now = now_secs();
+    let loser = match winner {
+        ConflictWinner::Local => "device",
+        ConflictWinner::Remote => "desktop",
     };
-    let date = conflict_date_string(now_secs());
-    let backup_name = format!("{} (conflict {date})", local.metadata.visible_name);
+    let backup_subdir = format!("{}/{}-{loser}-{now}", action.uuid, conflict_date_string(now));
+    tracing::info!(
+        uuid = %action.uuid,
+        name = %local.metadata.visible_name,
+        local_mtime = local.mtime,
+        remote_mtime = remote.mtime,
+        clock_offset_secs,
+        winner = ?winner,
+        backup = %backup_subdir,
+        "two-sided change resolved by modified time"
+    );
     ConflictResolution {
         uuid: action.uuid.clone(),
         visible_name: local.metadata.visible_name.clone(),
         winner,
-        backup_uuid: uuid::Uuid::new_v4().to_string(),
-        backup_name,
+        backup_subdir,
         local_mtime: local.mtime,
         remote_mtime: remote.mtime,
+        clock_offset_secs,
     }
 }
 
@@ -637,27 +676,14 @@ impl SyncOrchestrator {
         // 5. Resolve conflicts
         if plan.has_conflicts() && !self.cancel.is_cancelled() {
             callback(SyncProgressEvent::Phase(SyncPhase::ResolvingConflicts));
-            match resolve_all_conflicts(&self.connection, &plan, &local, &remote, &sync_dir, &self.db).await {
-                Ok(resolutions) => {
-                    report.conflicts_resolved = resolutions.len();
-                    tracing::info!(resolved = resolutions.len(), "conflicts resolved");
-                    for r in resolutions {
-                        let n = r.to_notification();
-                        tracing::info!(
-                            document = %n.document_name,
-                            winner = %n.winner_source,
-                            "conflict resolved"
-                        );
-                        callback(SyncProgressEvent::ConflictResolved(n));
-                    }
-                }
-                Err(e) => {
-                    let msg = format!("conflict resolution failed: {e}");
-                    tracing::error!(error = format!("{e:#}"), "conflict resolution failed");
-                    callback(SyncProgressEvent::Error(msg.clone()));
-                    report.errors.push(msg);
-                }
+            let (resolutions, errors) =
+                resolve_all_conflicts(&self.connection, &plan, &local, &remote, &sync_dir, &self.db).await;
+            report.conflicts_resolved = resolutions.len();
+            tracing::info!(resolved = resolutions.len(), failed = errors.len(), "two-sided changes processed");
+            for r in resolutions {
+                callback(SyncProgressEvent::ConflictResolved(r.to_notification()));
             }
+            report.errors.extend(errors);
         }
 
         // 6. Pulls
@@ -774,7 +800,8 @@ impl SyncOrchestrator {
         }
 
         // 9. Reload xochitl
-        if (plan.total_push > 0 || plan.total_delete > 0) && !self.cancel.is_cancelled() {
+        if (plan.total_push > 0 || plan.total_delete > 0 || plan.total_conflict > 0)
+            && !self.cancel.is_cancelled() {
             let _ = reload_xochitl(&mut self.connection).await;
         }
 
@@ -1129,8 +1156,7 @@ mod tests {
         let a = action_conflict("a", 100, 200);
         let l = local_with_mtime("a", "hL", 100);
         let r = remote_with_mtime("a", "hR", 200);
-        let res = resolve_conflict(&a, &l, &r);
-        assert_eq!(res.winner, ConflictWinner::Remote);
+        assert_eq!(resolve_conflict(&a, &l, &r, 0).winner, ConflictWinner::Remote);
     }
 
     #[test]
@@ -1138,28 +1164,46 @@ mod tests {
         let a = action_conflict("a", 300, 200);
         let l = local_with_mtime("a", "hL", 300);
         let r = remote_with_mtime("a", "hR", 200);
-        let res = resolve_conflict(&a, &l, &r);
-        assert_eq!(res.winner, ConflictWinner::Local);
+        assert_eq!(resolve_conflict(&a, &l, &r, 0).winner, ConflictWinner::Local);
     }
 
     #[test]
-    fn conflict_equal_mtime_favours_remote() {
-        let a = action_conflict("a", 100, 100);
-        let l = local_with_mtime("a", "hL", 100);
-        let r = remote_with_mtime("a", "hR", 100);
-        let res = resolve_conflict(&a, &l, &r);
-        assert_eq!(res.winner, ConflictWinner::Remote);
+    fn conflict_identical_timestamps_favour_device() {
+        assert_eq!(pick_winner(100, 100, 0), ConflictWinner::Remote);
     }
 
     #[test]
-    fn conflict_generates_backup_name_and_uuid() {
+    fn conflict_within_tolerance_is_a_tie() {
+        assert_eq!(pick_winner(102, 100, 0), ConflictWinner::Remote);
+        assert_eq!(pick_winner(103, 100, 0), ConflictWinner::Local);
+    }
+
+    #[test]
+    fn fast_device_clock_does_not_beat_a_genuinely_newer_desktop_edit() {
+        // Device clock runs 1h fast. Its edit stamped 1000+3600 really happened
+        // at desktop-time 1000; the desktop edit at 1500 is newer.
+        assert_eq!(pick_winner(1500, 4600, 3600), ConflictWinner::Local);
+        // Without compensation the device would wrongly win.
+        assert_eq!(pick_winner(1500, 4600, 0), ConflictWinner::Remote);
+    }
+
+    #[test]
+    fn slow_device_clock_does_not_lose_a_genuinely_newer_device_edit() {
+        // Device clock runs 1h slow. Its edit at stamp 5000-3600=1400 really
+        // happened at desktop-time 5000, after the desktop edit at 2000.
+        assert_eq!(pick_winner(2000, 1400, -3600), ConflictWinner::Remote);
+        assert_eq!(pick_winner(2000, 1400, 0), ConflictWinner::Local);
+    }
+
+    #[test]
+    fn conflict_backup_lives_under_the_uuid_and_names_the_loser() {
         let a = action_conflict("a", 1, 2);
         let l = local_with_mtime("a", "hL", 1);
         let r = remote_with_mtime("a", "hR", 2);
-        let res = resolve_conflict(&a, &l, &r);
-        assert!(res.backup_name.starts_with("a (conflict "));
-        assert_eq!(res.backup_uuid.len(), 36); // UUID v4 string length
-        assert_ne!(res.backup_uuid, "a");
+        let res = resolve_conflict(&a, &l, &r, 0);
+        assert!(res.backup_subdir.starts_with("a/"));
+        assert!(res.backup_subdir.contains("-desktop-"));
+        assert!(!res.backup_subdir.contains("conflict"));
     }
 
     #[test]
@@ -1167,10 +1211,19 @@ mod tests {
         let a = action_conflict("a", 100, 100 + 7200);
         let l = local_with_mtime("a", "hL", 100);
         let r = remote_with_mtime("a", "hR", 100 + 7200);
-        let res = resolve_conflict(&a, &l, &r);
-        let n = res.to_notification();
+        let n = resolve_conflict(&a, &l, &r, 0).to_notification();
         assert_eq!(n.winner_source, "reMarkable");
         assert!(n.time_difference_human.contains("hour"));
+    }
+
+    #[test]
+    fn conflict_notification_delta_is_skew_adjusted() {
+        // Raw stamps differ by 2h, but 1h of that is clock offset.
+        let a = action_conflict("a", 100, 100 + 7200);
+        let l = local_with_mtime("a", "hL", 100);
+        let r = remote_with_mtime("a", "hR", 100 + 7200);
+        let n = resolve_conflict(&a, &l, &r, 3600).to_notification();
+        assert_eq!(n.time_difference_human, "reMarkable was 1 hour newer");
     }
 
     #[test]

@@ -148,7 +148,7 @@ fn bidirectional_sync_pulls_pushes_and_skips() {
 }
 
 #[test]
-fn conflict_resolution_picks_newer_side_and_names_backup() {
+fn conflict_resolution_picks_newer_side_and_backs_up_without_a_duplicate() {
     let plan_action = SyncAction {
         uuid: "a".into(),
         visible_name: "Note".into(),
@@ -160,10 +160,11 @@ fn conflict_resolution_picks_newer_side_and_names_backup() {
     };
     let local = local_snap("a", "hL", 100);
     let remote = remote_snap("a", "hR", 200);
-    let resolution = resolve_conflict(&plan_action, &local, &remote);
+    let resolution = resolve_conflict(&plan_action, &local, &remote, 0);
     assert_eq!(resolution.winner, ConflictWinner::Remote);
-    assert!(resolution.backup_name.contains("(conflict "));
-    assert_eq!(resolution.backup_uuid.len(), 36);
+    // The loser is backed up under its own uuid, not as a "(conflict ...)" document.
+    assert!(resolution.backup_subdir.starts_with("a/"));
+    assert!(!resolution.backup_subdir.contains("conflict"));
 }
 
 #[test]

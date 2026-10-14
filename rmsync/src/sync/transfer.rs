@@ -669,10 +669,9 @@ fn now_secs() -> u64 {
 // Conflict resolution execution (spec 14)
 // =========================================================================
 
-/// Execute a resolved conflict. On Remote-wins we preserve the local copy
-/// under a new backup UUID then pull the remote. On Local-wins we pull the
-/// remote under the backup UUID, keep local files in place, and push the
-/// original UUID back to the device.
+/// Execute a resolved two-sided change. The newer side overwrites the older
+/// one in place under the same UUID, after the older version has been saved
+/// under `.rmsync/backups/` — no second document is created.
 pub async fn execute_conflict_resolution(
     conn: &DeviceConnection,
     resolution: &ConflictResolution,
@@ -681,115 +680,121 @@ pub async fn execute_conflict_resolution(
     sync_dir: &Path,
     db: &StateDb,
 ) -> Result<()> {
+    if !is_safe_uuid(&resolution.uuid) {
+        anyhow::bail!("refusing to resolve conflict for unsafe uuid {}", resolution.uuid);
+    }
     let raw = sync_dir.join(RAW_SUBDIR);
     tokio::fs::create_dir_all(&raw).await?;
+    let backup_dir = backup_root(sync_dir).join(&resolution.backup_subdir);
     match resolution.winner {
         ConflictWinner::Remote => {
-            copy_local_as_backup(&raw, &resolution.uuid, &resolution.backup_uuid, &resolution.backup_name)?;
-            let _ = pull_document(conn, &resolution.uuid, sync_dir).await?;
-            record_winner_state(db, &resolution.uuid, local, remote, ConflictWinner::Remote)?;
-            record_backup_state(db, &resolution.backup_uuid, &resolution.backup_name, local)?;
+            // Desktop version loses: keep it, then take the device's.
+            copy_local_to_backup(&raw, &resolution.uuid, &backup_dir)?;
+            let pulled = pull_document(conn, &resolution.uuid, sync_dir).await?;
+            if !pulled.success {
+                anyhow::bail!(
+                    "pulling the newer device version failed: {}",
+                    pulled.error.as_deref().unwrap_or("unknown error")
+                );
+            }
         }
         ConflictWinner::Local => {
-            pull_document_to_backup(conn, &resolution.uuid, &resolution.backup_uuid, &resolution.backup_name, sync_dir).await?;
-            let _ = push_document(conn, &resolution.uuid, sync_dir).await?;
-            record_winner_state(db, &resolution.uuid, local, remote, ConflictWinner::Local)?;
-            record_backup_state(db, &resolution.backup_uuid, &resolution.backup_name, local)?;
-        }
-    }
-    Ok(())
-}
-
-fn copy_local_as_backup(
-    raw: &Path,
-    uuid: &str,
-    backup_uuid: &str,
-    backup_name: &str,
-) -> Result<()> {
-    for entry in std::fs::read_dir(raw)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if let Some(suffix) = name.strip_prefix(&format!("{uuid}.")) {
-            let dest = raw.join(format!("{backup_uuid}.{suffix}"));
-            if suffix == "metadata" {
-                let mut md: RemarkableMetadata = serde_json::from_slice(&std::fs::read(entry.path())?)?;
-                md.visible_name = backup_name.to_string();
-                std::fs::write(&dest, serde_json::to_vec_pretty(&md)?)?;
-            } else {
-                std::fs::copy(entry.path(), &dest)?;
+            // Device version loses: keep it, then overwrite it with ours.
+            download_remote_to_backup(conn, &resolution.uuid, &raw, &backup_dir).await?;
+            let pushed = push_document(conn, &resolution.uuid, sync_dir).await?;
+            if !pushed.success {
+                anyhow::bail!(
+                    "uploading the newer desktop version failed: {}",
+                    pushed.error.as_deref().unwrap_or("unknown error")
+                );
             }
         }
     }
-    let subdir = raw.join(uuid);
-    if subdir.is_dir() {
-        let dest_dir = raw.join(backup_uuid);
-        std::fs::create_dir_all(&dest_dir)?;
-        for entry in std::fs::read_dir(&subdir)? {
-            let entry = entry?;
-            std::fs::copy(entry.path(), dest_dir.join(entry.file_name()))?;
+    record_winner_state(db, &resolution.uuid, local, remote, resolution.winner.clone())?;
+    tracing::info!(
+        uuid = %resolution.uuid,
+        winner = ?resolution.winner,
+        backup = %backup_dir.display(),
+        "overwritten version saved as backup"
+    );
+    Ok(())
+}
+
+/// Root of all conflict backups. Lives beside the state DB, outside `raw/`.
+pub fn backup_root(sync_dir: &Path) -> PathBuf {
+    sync_dir.join(".rmsync").join("backups")
+}
+
+/// Copy every local file for `uuid` into `backup_dir`, keeping the names and
+/// layout they have under `raw/`.
+fn copy_local_to_backup(raw: &Path, uuid: &str, backup_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(backup_dir)?;
+    for (path, rel) in local_files_for_uuid(raw, uuid)? {
+        let dest = backup_dir.join(&rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
         }
+        std::fs::copy(&path, &dest)
+            .with_context(|| format!("backing up {}", path.display()))?;
     }
     Ok(())
 }
 
-async fn pull_document_to_backup(
+/// Download the device's current copy of `uuid` into `backup_dir`, laid out as
+/// it would be under `raw/`. Remote paths are validated like any pull.
+async fn download_remote_to_backup(
     conn: &DeviceConnection,
     uuid: &str,
-    backup_uuid: &str,
-    backup_name: &str,
-    sync_dir: &Path,
+    raw: &Path,
+    backup_dir: &Path,
 ) -> Result<()> {
-    let raw = sync_dir.join(RAW_SUBDIR);
-    tokio::fs::create_dir_all(&raw).await?;
-    if !is_safe_uuid(uuid) || !is_safe_uuid(backup_uuid) {
-        return Err(anyhow::anyhow!(
-            "refusing to pull backup for unsafe uuid {uuid} / {backup_uuid}"
-        ));
-    }
-    let remote_files = list_remote_files_for_uuid(conn, uuid).await?;
-    for f in &remote_files {
-        // Resolve the remote path safely under the ORIGINAL uuid first, then
-        // rebase onto backup_uuid. Skip anything a malicious tablet tries to
-        // smuggle outside raw/.
-        let safe = match safe_local_path_for(&raw, uuid, &f.path) {
-            Some(p) => p,
-            None => {
-                tracing::warn!("rejecting unsafe backup remote path: {}", f.path);
-                continue;
-            }
-        };
-        // `safe` is guaranteed to live under `raw` (and under `raw/{uuid}`
-        // or `raw/` directly). Rebase by replacing the uuid component(s).
-        let rel = safe.strip_prefix(&raw).expect("safe_local_path_for guarantees prefix");
-        let mut remapped = raw.clone();
-        for component in rel.components() {
-            let s = component.as_os_str().to_string_lossy();
-            if s == uuid {
-                remapped.push(backup_uuid);
-            } else if s.starts_with(&format!("{uuid}.")) {
-                remapped.push(format!("{backup_uuid}.{}", &s[uuid.len() + 1..]));
-            } else {
-                remapped.push(component);
-            }
+    std::fs::create_dir_all(backup_dir)?;
+    for f in list_remote_files_for_uuid(conn, uuid).await? {
+        if f.is_dir {
+            continue;
         }
-        let local_path = remapped;
-        if let Some(parent) = local_path.parent() {
+        let Some(safe) = safe_local_path_for(raw, uuid, &f.path) else {
+            tracing::warn!(path = %f.path, "rejecting unsafe remote path while backing up");
+            continue;
+        };
+        let rel = safe.strip_prefix(raw).expect("safe_local_path_for guarantees prefix");
+        let dest = backup_dir.join(rel);
+        if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
         let bytes = conn.read_file(&f.path).await?;
-        let tmp = tmp_path(&local_path);
-        tokio::fs::write(&tmp, &bytes).await?;
-        tokio::fs::rename(&tmp, &local_path).await?;
-    }
-    let backup_meta = raw.join(format!("{backup_uuid}.metadata"));
-    if backup_meta.exists() {
-        let bytes = std::fs::read(&backup_meta)?;
-        if let Ok(mut md) = serde_json::from_slice::<RemarkableMetadata>(&bytes) {
-            md.visible_name = backup_name.to_string();
-            std::fs::write(&backup_meta, serde_json::to_vec_pretty(&md)?)?;
-        }
+        tokio::fs::write(&dest, &bytes).await?;
     }
     Ok(())
+}
+
+/// Measure the device clock minus the desktop clock, in seconds.
+///
+/// Writes a throwaway file in the device's `/tmp` and reads back the mtime the
+/// device stamped on it, which is the device clock's "now". Returns `None`
+/// (callers treat as 0) if the probe can't run; resolution still works, just
+/// without skew compensation.
+pub async fn estimate_clock_offset(conn: &DeviceConnection) -> Option<i64> {
+    const PROBE: &str = "/tmp/rmsync-clock-probe";
+    let before = now_secs();
+    conn.write_file(PROBE, b"").await.ok()?;
+    let device_now = conn
+        .list_dir("/tmp")
+        .await
+        .ok()
+        .and_then(|e| e.into_iter().find(|f| f.path == PROBE))
+        .map(|f| f.mtime);
+    let _ = conn.delete_file(PROBE).await;
+    let device_now = device_now?;
+    let offset = clock_offset(device_now, before, now_secs());
+    tracing::debug!(device_now, offset_secs = offset, "measured device clock offset");
+    Some(offset)
+}
+
+/// Offset given the device's stamp and the desktop clock either side of the
+/// probe; the midpoint absorbs the round-trip.
+fn clock_offset(device_now: u64, local_before: u64, local_after: u64) -> i64 {
+    device_now as i64 - ((local_before + local_after) / 2) as i64
 }
 
 fn record_winner_state(
@@ -826,32 +831,9 @@ fn record_winner_state(
     Ok(())
 }
 
-fn record_backup_state(
-    db: &StateDb,
-    backup_uuid: &str,
-    backup_name: &str,
-    local: &LocalDocumentSnapshot,
-) -> Result<()> {
-    let state = SyncFileState {
-        uuid: backup_uuid.to_string(),
-        visible_name: backup_name.to_string(),
-        parent_uuid: local.metadata.parent.clone(),
-        doc_type: local.metadata.doc_type.clone(),
-        local_hash: Some(local.content_hash.clone()),
-        remote_hash: None,
-        synced_hash: None,
-        local_mtime: Some(local.mtime),
-        remote_mtime: None,
-        synced_mtime: None,
-        last_sync_at: None,
-        sync_status: SyncStatus::Pending,
-        conflict_info: None,
-    };
-    db.upsert_state(&state)?;
-    Ok(())
-}
-
-/// Resolve every Conflict action in a plan using last-write-wins.
+/// Resolve every Conflict action in a plan (newest modification wins). A
+/// document that fails to resolve is reported and left for the next sync; it
+/// does not stop the others.
 pub async fn resolve_all_conflicts(
     conn: &DeviceConnection,
     plan: &SyncPlan,
@@ -859,8 +841,9 @@ pub async fn resolve_all_conflicts(
     remote_manifest: &RemoteManifest,
     sync_dir: &Path,
     db: &StateDb,
-) -> Result<Vec<ConflictResolution>> {
-    let mut out = Vec::new();
+) -> (Vec<ConflictResolution>, Vec<String>) {
+    let mut resolved = Vec::new();
+    let mut errors = Vec::new();
     let local_map: std::collections::HashMap<&str, &LocalDocumentSnapshot> = local_manifest
         .documents
         .iter()
@@ -871,17 +854,30 @@ pub async fn resolve_all_conflicts(
         .iter()
         .map(|d| (d.uuid.as_str(), d))
         .collect();
+    let clock_offset = match estimate_clock_offset(conn).await {
+        Some(o) => o,
+        None => {
+            tracing::warn!("could not measure device clock; comparing modified times as-is");
+            0
+        }
+    };
     for action in plan.conflicts() {
-        if let (Some(l), Some(r)) = (
+        let (Some(l), Some(r)) = (
             local_map.get(action.uuid.as_str()),
             remote_map.get(action.uuid.as_str()),
-        ) {
-            let resolution = crate::sync::engine::resolve_conflict(action, l, r);
-            execute_conflict_resolution(conn, &resolution, l, r, sync_dir, db).await?;
-            out.push(resolution);
+        ) else {
+            continue;
+        };
+        let resolution = crate::sync::engine::resolve_conflict(action, l, r, clock_offset);
+        match execute_conflict_resolution(conn, &resolution, l, r, sync_dir, db).await {
+            Ok(()) => resolved.push(resolution),
+            Err(e) => {
+                tracing::error!(uuid = %action.uuid, error = format!("{e:#}"), "conflict resolution failed");
+                errors.push(format!("resolve {}: {e}", action.uuid));
+            }
         }
     }
-    Ok(out)
+    (resolved, errors)
 }
 
 #[cfg(test)]
@@ -1064,42 +1060,35 @@ mod tests {
     }
 
     #[test]
-    fn copy_local_as_backup_preserves_user_work_and_renames_metadata() {
-        // Conflict-resolution backup path: when remote wins we MUST preserve
-        // the user's local copy byte-for-byte (page files) and rewrite only
-        // the visibleName in metadata. A bug here silently destroys work.
+    fn local_backup_preserves_every_byte_and_leaves_the_original_alone() {
+        // When the device wins, the desktop copy is only ever overwritten after
+        // this backup. A bug here silently destroys work.
         let dir = tempdir().unwrap();
-        let raw = dir.path();
-        let meta = r#"{"deleted":false,"lastModified":"1","parent":"p","pinned":false,"type":"DocumentType","visibleName":"Original"}"#;
-        std::fs::write(raw.join("abc.metadata"), meta).unwrap();
-        std::fs::write(raw.join("abc.content"), b"content-bytes").unwrap();
+        let raw = dir.path().join("raw");
         std::fs::create_dir_all(raw.join("abc")).unwrap();
+        std::fs::write(raw.join("abc.metadata"), b"meta-bytes").unwrap();
+        std::fs::write(raw.join("abc.content"), b"content-bytes").unwrap();
         std::fs::write(raw.join("abc/p1.rm"), b"page-1-bytes").unwrap();
         std::fs::write(raw.join("other.metadata"), b"untouched").unwrap();
+        let backup = backup_root(dir.path()).join("abc/2026-10-14-desktop-1");
 
-        copy_local_as_backup(raw, "abc", "backup-uuid", "Original (conflict)").unwrap();
+        copy_local_to_backup(&raw, "abc", &backup).unwrap();
 
-        // Original files must be untouched — this is the user's preserved copy.
-        assert_eq!(std::fs::read(raw.join("abc.content")).unwrap(), b"content-bytes");
+        assert_eq!(std::fs::read(backup.join("abc.metadata")).unwrap(), b"meta-bytes");
+        assert_eq!(std::fs::read(backup.join("abc.content")).unwrap(), b"content-bytes");
+        assert_eq!(std::fs::read(backup.join("abc/p1.rm")).unwrap(), b"page-1-bytes");
+        // Other documents are not swept in, and originals are untouched.
+        assert!(!backup.join("other.metadata").exists());
         assert_eq!(std::fs::read(raw.join("abc/p1.rm")).unwrap(), b"page-1-bytes");
-        assert_eq!(std::fs::read(raw.join("other.metadata")).unwrap(), b"untouched");
+        // A backup is not a document: nothing new appears under raw/.
+        assert_eq!(std::fs::read_dir(&raw).unwrap().count(), 4);
+    }
 
-        // Page files must be copied byte-for-byte under the backup uuid.
-        assert_eq!(
-            std::fs::read(raw.join("backup-uuid/p1.rm")).unwrap(),
-            b"page-1-bytes"
-        );
-        assert_eq!(
-            std::fs::read(raw.join("backup-uuid.content")).unwrap(),
-            b"content-bytes"
-        );
-
-        // Metadata must carry the new visibleName and still be valid JSON.
-        let backup_meta: RemarkableMetadata =
-            serde_json::from_slice(&std::fs::read(raw.join("backup-uuid.metadata")).unwrap())
-                .unwrap();
-        assert_eq!(backup_meta.visible_name, "Original (conflict)");
-        assert_eq!(backup_meta.parent, "p");
+    #[test]
+    fn clock_offset_uses_the_probe_midpoint() {
+        assert_eq!(clock_offset(1000, 1000, 1000), 0);
+        assert_eq!(clock_offset(4600, 1000, 1002), 3599); // device ~1h fast
+        assert_eq!(clock_offset(0, 3600, 3600), -3600); // device ~1h slow
     }
 
     fn push_action(uuid: &str) -> SyncAction {
