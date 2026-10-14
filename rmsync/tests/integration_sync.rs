@@ -248,3 +248,54 @@ fn empty_paths_helper_is_stable() {
     let p = Path::new("/tmp");
     _silence(&p);
 }
+
+/// Scan the sync dir, then build the diff as if the device still held exactly
+/// what the first scan saw (`baseline` is what the last sync recorded).
+fn plan_against_unchanged_device(
+    sync_dir: &Path,
+    baseline: &LocalManifest,
+) -> rmsync::sync::engine::SyncPlan {
+    let remote = remote_manifest(
+        baseline
+            .documents
+            .iter()
+            .map(|d| remote_snap(&d.uuid, &d.content_hash, 100))
+            .collect(),
+    );
+    let synced: Vec<SyncFileState> = baseline
+        .documents
+        .iter()
+        .map(|d| synced_state(&d.uuid, &d.content_hash))
+        .collect();
+    let local = scan_local(sync_dir).unwrap();
+    compute_sync_plan_from_parts(&local, &remote, &synced)
+}
+
+#[test]
+fn desktop_edit_is_pushed_and_untouched_document_is_skipped() {
+    let dir = tempdir().unwrap();
+    let raw = dir.path().join("raw");
+    std::fs::create_dir_all(&raw).unwrap();
+    common::seed_notebook(&raw, "edited", "Edited", "");
+    common::seed_notebook(&raw, "untouched", "Untouched", "");
+    let baseline = scan_local(dir.path()).unwrap();
+
+    // Nothing changed yet: neither document is re-uploaded.
+    let plan = plan_against_unchanged_device(dir.path(), &baseline);
+    assert!(plan.is_empty(), "unexpected actions: {}", plan.summary());
+
+    // Edit one page of one notebook on the desktop.
+    common::create_rm_v6_with_stroke(
+        &raw.join("edited").join("page1.rm"),
+        &[(0.0, 0.0), (10.0, 10.0), (20.0, 5.0)],
+    )
+    .unwrap();
+
+    let plan = plan_against_unchanged_device(dir.path(), &baseline);
+    let action = |uuid: &str| plan.actions.iter().find(|a| a.uuid == uuid).unwrap();
+    assert_eq!(action("edited").action_type, SyncActionType::Push);
+    assert_eq!(action("untouched").action_type, SyncActionType::Skip);
+    assert_eq!(plan.total_push, 1);
+    // Matched by UUID: no extra document appears.
+    assert_eq!(plan.actions.len(), 2);
+}

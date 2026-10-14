@@ -380,6 +380,7 @@ pub async fn push_document(
     }
 
     let local_files = local_files_for_uuid(&raw, uuid)?;
+    tracing::debug!(uuid, files = local_files.len(), "uploading document to device");
     let subdir_remote = format!("{XOCHITL_PATH}/{uuid}");
     if local_files.iter().any(|(_, rel)| rel.starts_with(&format!("{uuid}/"))) {
         let _ = conn.mkdir(&subdir_remote).await;
@@ -479,47 +480,51 @@ where
             bytes_done,
             bytes_total: 0,
         });
-        let result = push_document(conn, &action.uuid, sync_dir).await?;
+        let result = match push_document(conn, &action.uuid, sync_dir).await {
+            Ok(r) => r,
+            // One unreadable document must not stop the rest of the batch.
+            Err(e) => PushResult {
+                uuid: action.uuid.clone(),
+                files_transferred: 0,
+                bytes_transferred: 0,
+                duration_ms: 0,
+                success: false,
+                error: Some(format!("{e:#}")),
+            },
+        };
         if result.success {
-            let local_hash = scan_local_hash_for_uuid(
-                &action.uuid,
-                &sync_dir.join(crate::sync::scanner::RAW_SUBDIR),
+            let raw = sync_dir.join(crate::sync::scanner::RAW_SUBDIR);
+            let local_hash = scan_local_hash_for_uuid(&action.uuid, &raw);
+            let parent_and_type = parent_and_type(&raw, &action.uuid);
+            let state = state_after_push(
+                db.get_state(&result.uuid)?,
+                action,
+                local_hash,
+                parent_and_type,
+                now_secs(),
             );
-            let now = now_secs();
-            let state = match db.get_state(&result.uuid)? {
-                Some(mut existing) => {
-                    existing.remote_hash = local_hash.clone();
-                    existing.synced_hash = local_hash;
-                    existing.sync_status = SyncStatus::Synced;
-                    existing.last_sync_at = Some(now);
-                    existing
-                }
-                None => {
-                    let (parent_uuid, doc_type) = parent_and_type(
-                        &sync_dir.join(crate::sync::scanner::RAW_SUBDIR),
-                        &action.uuid,
-                    );
-                    SyncFileState {
-                        uuid: action.uuid.clone(),
-                        visible_name: action.visible_name.clone(),
-                        parent_uuid,
-                        doc_type,
-                        local_hash: local_hash.clone(),
-                        remote_hash: local_hash.clone(),
-                        synced_hash: local_hash,
-                        local_mtime: Some(now),
-                        remote_mtime: Some(now),
-                        synced_mtime: Some(now),
-                        last_sync_at: Some(now),
-                        sync_status: SyncStatus::Synced,
-                        conflict_info: None,
-                    }
-                }
-            };
             db.upsert_state(&state)?;
-        } else if let Some(mut state) = db.get_state(&result.uuid)? {
-            state.sync_status = SyncStatus::Error;
-            db.upsert_state(&state)?;
+            tracing::info!(
+                uuid = %action.uuid,
+                name = %action.visible_name,
+                files = result.files_transferred,
+                bytes = result.bytes_transferred,
+                duration_ms = result.duration_ms,
+                "pushed document to device"
+            );
+        } else {
+            // The baseline is left untouched, so the local change is still
+            // detected and the push is retried on the next sync.
+            tracing::error!(
+                uuid = %action.uuid,
+                name = %action.visible_name,
+                error = result.error.as_deref().unwrap_or("unknown"),
+                "push failed; will retry on next sync"
+            );
+            if let Some(mut state) = db.get_state(&result.uuid)? {
+                state.sync_status = SyncStatus::Error;
+                db.upsert_state(&state)?;
+            }
         }
         bytes_done += result.bytes_transferred;
         results.push(result);
@@ -533,6 +538,43 @@ where
         bytes_total: 0,
     });
     Ok(results)
+}
+
+/// The state row to record once a document has been uploaded: the device now
+/// holds exactly what is on disk, so the local, remote and synced hashes all
+/// agree and the next diff sees the document as unchanged.
+fn state_after_push(
+    existing: Option<SyncFileState>,
+    action: &SyncAction,
+    local_hash: Option<String>,
+    (parent_uuid, doc_type): (String, String),
+    now: u64,
+) -> SyncFileState {
+    let mut state = existing.unwrap_or_else(|| SyncFileState {
+        uuid: action.uuid.clone(),
+        visible_name: action.visible_name.clone(),
+        parent_uuid,
+        doc_type,
+        local_hash: None,
+        remote_hash: None,
+        synced_hash: None,
+        local_mtime: None,
+        remote_mtime: None,
+        synced_mtime: None,
+        last_sync_at: None,
+        sync_status: SyncStatus::Synced,
+        conflict_info: None,
+    });
+    state.local_hash = local_hash.clone();
+    state.remote_hash = local_hash.clone();
+    state.synced_hash = local_hash;
+    state.local_mtime = Some(now);
+    state.remote_mtime = Some(now);
+    state.synced_mtime = Some(now);
+    state.sync_status = SyncStatus::Synced;
+    state.last_sync_at = Some(now);
+    state.conflict_info = None;
+    state
 }
 
 /// Delete every remote file for `uuid` on the reMarkable.
@@ -1058,5 +1100,63 @@ mod tests {
                 .unwrap();
         assert_eq!(backup_meta.visible_name, "Original (conflict)");
         assert_eq!(backup_meta.parent, "p");
+    }
+
+    fn push_action(uuid: &str) -> SyncAction {
+        SyncAction {
+            uuid: uuid.into(),
+            visible_name: "Notes".into(),
+            action_type: SyncActionType::Push,
+            priority: 1,
+        }
+    }
+
+    fn baseline(uuid: &str, hash: &str) -> SyncFileState {
+        SyncFileState {
+            uuid: uuid.into(),
+            visible_name: "Notes".into(),
+            parent_uuid: String::new(),
+            doc_type: "DocumentType".into(),
+            local_hash: Some("old".into()),
+            remote_hash: Some(hash.into()),
+            synced_hash: Some(hash.into()),
+            local_mtime: Some(1),
+            remote_mtime: Some(1),
+            synced_mtime: Some(1),
+            last_sync_at: Some(1),
+            sync_status: SyncStatus::Error,
+            conflict_info: None,
+        }
+    }
+
+    #[test]
+    fn state_after_push_updates_existing_row_in_place() {
+        let s = state_after_push(
+            Some(baseline("u1", "old")),
+            &push_action("u1"),
+            Some("new".into()),
+            (String::new(), String::new()),
+            500,
+        );
+        assert_eq!(s.uuid, "u1");
+        assert_eq!(s.local_hash.as_deref(), Some("new"));
+        assert_eq!(s.remote_hash.as_deref(), Some("new"));
+        assert_eq!(s.synced_hash.as_deref(), Some("new"));
+        assert_eq!(s.synced_mtime, Some(500));
+        assert_eq!(s.sync_status, SyncStatus::Synced);
+    }
+
+    #[test]
+    fn state_after_push_creates_row_for_new_document() {
+        let s = state_after_push(
+            None,
+            &push_action("u2"),
+            Some("h".into()),
+            ("parent".into(), "DocumentType".into()),
+            7,
+        );
+        assert_eq!(s.parent_uuid, "parent");
+        assert_eq!(s.synced_hash.as_deref(), Some("h"));
+        assert_eq!(s.last_sync_at, Some(7));
     }
 }

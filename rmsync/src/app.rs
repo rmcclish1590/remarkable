@@ -289,7 +289,11 @@ fn start_sync(
                 }
                 SyncProgressEvent::Complete(report) => {
                     if !report.errors.is_empty() {
-                        controls.show_error(&report.errors[0]);
+                        let first = &report.errors[0];
+                        match report.errors.len() {
+                            1 => controls.show_error(first),
+                            n => controls.show_error(&format!("{first} (and {} more errors)", n - 1)),
+                        }
                     } else if saw_error {
                         // leave the error UI as-is; the earlier Error event
                         // already displayed a meaningful message.
