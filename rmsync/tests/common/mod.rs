@@ -130,10 +130,23 @@ pub fn write_metadata(
     name: &str,
     deleted: bool,
 ) {
+    write_metadata_modified(dir, uuid, parent, doc_type, name, deleted, 1);
+}
+
+/// Like `write_metadata`, with an explicit `lastModified` (milliseconds).
+pub fn write_metadata_modified(
+    dir: &Path,
+    uuid: &str,
+    parent: &str,
+    doc_type: &str,
+    name: &str,
+    deleted: bool,
+    last_modified_ms: u64,
+) {
     let body = format!(
         r#"{{
           "deleted": {deleted},
-          "lastModified": "1",
+          "lastModified": "{last_modified_ms}",
           "parent": "{parent}",
           "pinned": false,
           "type": "{doc_type}",

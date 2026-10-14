@@ -430,7 +430,7 @@ async fn upload_atomic(
     Ok(data.len() as u64)
 }
 
-fn local_files_for_uuid(raw: &Path, uuid: &str) -> Result<Vec<(PathBuf, String)>> {
+pub(crate) fn local_files_for_uuid(raw: &Path, uuid: &str) -> Result<Vec<(PathBuf, String)>> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(raw)? {
         let entry = entry?;
@@ -613,7 +613,7 @@ pub async fn reload_xochitl(conn: &mut DeviceConnection) -> Result<()> {
 /// Compute a local content hash for a single UUID after pull/push. Falls
 /// back to an empty string if the files can't be read — the next sync will
 /// detect the mismatch and re-classify.
-fn scan_local_hash_for_uuid(uuid: &str, raw: &Path) -> Option<String> {
+pub(crate) fn scan_local_hash_for_uuid(uuid: &str, raw: &Path) -> Option<String> {
     let mut files = Vec::new();
     if let Ok(entries) = std::fs::read_dir(raw) {
         for entry in entries.flatten() {
