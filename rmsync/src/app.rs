@@ -205,8 +205,10 @@ pub(crate) fn wire_sync_button(
         let browser = browser.clone();
         let config = config.clone();
         let last_sync_label = last_sync_label.clone();
+        let sync_window = window.clone();
         ensure_device_configured(&window, config.clone(), move || {
             start_sync(
+                sync_window.clone(),
                 controls.clone(),
                 browser.clone(),
                 last_sync_label.clone(),
@@ -217,6 +219,7 @@ pub(crate) fn wire_sync_button(
 }
 
 fn start_sync(
+    window: adw::ApplicationWindow,
     controls: SyncControls,
     browser: FolderBrowser,
     last_sync_label: gtk::Label,
@@ -286,6 +289,31 @@ fn start_sync(
                 SyncProgressEvent::Error(msg) => {
                     saw_error = true;
                     controls.show_error(&msg);
+                }
+                SyncProgressEvent::HostKeyMismatch(change) => {
+                    saw_error = true;
+                    let known_hosts = config.borrow().to_connection_config().known_hosts_path;
+                    let retry = {
+                        let (window, controls, browser, label, config) = (
+                            window.clone(),
+                            controls.clone(),
+                            browser.clone(),
+                            last_sync_label.clone(),
+                            config.clone(),
+                        );
+                        move || {
+                            start_sync(
+                                window.clone(),
+                                controls.clone(),
+                                browser.clone(),
+                                label.clone(),
+                                config.clone(),
+                            )
+                        }
+                    };
+                    crate::ui::sync_controls::show_host_key_mismatch_dialog(
+                        &window, change, known_hosts, retry,
+                    );
                 }
                 SyncProgressEvent::Complete(report) => {
                     if !report.errors.is_empty() {

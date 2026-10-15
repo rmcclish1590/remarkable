@@ -6,7 +6,7 @@
 //! key-pair generation for passwordless follow-up connections.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -38,11 +38,41 @@ pub enum ConnectionError {
     #[error("Not connected")]
     NotConnected,
     #[error("Host key mismatch — possible security issue")]
-    HostKeyMismatch,
+    HostKeyMismatch(HostKeyChange),
     #[error("Timeout after {0} seconds")]
     Timeout(u64),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// A pinned host key that no longer matches what the server presented.
+/// Fingerprints are stored as the bare base64 SHA-256 digest; use
+/// [`sha256_display`] to show them in the `SHA256:...` form `ssh-keygen -l`
+/// prints, so the user can compare against the device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostKeyChange {
+    pub algorithm: String,
+    pub pinned: String,
+    pub presented: String,
+}
+
+impl HostKeyChange {
+    pub fn pinned_display(&self) -> String {
+        sha256_display(&self.pinned)
+    }
+
+    pub fn presented_display(&self) -> String {
+        sha256_display(&self.presented)
+    }
+}
+
+/// Format a fingerprint in the standard `SHA256:<base64>` notation.
+pub fn sha256_display(fingerprint: &str) -> String {
+    if fingerprint.starts_with("SHA256:") {
+        fingerprint.to_string()
+    } else {
+        format!("SHA256:{fingerprint}")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -125,9 +155,11 @@ impl DeviceConnection {
             ..Default::default()
         });
 
+        let mismatch = Arc::new(Mutex::new(None));
         let handler = ClientHandler {
             known_hosts_path: self.config.known_hosts_path.clone(),
             matched_existing: false,
+            mismatch: mismatch.clone(),
         };
 
         let addr = (self.config.host.as_str(), self.config.port);
@@ -140,7 +172,8 @@ impl DeviceConnection {
         {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                let mapped = map_connect_err(e, &self.config);
+                let change = mismatch.lock().ok().and_then(|mut m| m.take());
+                let mapped = map_connect_err(e, &self.config, change);
                 tracing::warn!(
                     host = %self.config.host,
                     port = self.config.port,
@@ -416,7 +449,11 @@ impl DeviceConnection {
     }
 }
 
-fn map_connect_err(e: russh::Error, cfg: &ConnectionConfig) -> ConnectionError {
+fn map_connect_err(
+    e: russh::Error,
+    cfg: &ConnectionConfig,
+    change: Option<HostKeyChange>,
+) -> ConnectionError {
     match e {
         russh::Error::IO(io) if io.kind() == std::io::ErrorKind::ConnectionRefused => {
             ConnectionError::Unreachable(cfg.host.clone(), cfg.port)
@@ -425,7 +462,10 @@ fn map_connect_err(e: russh::Error, cfg: &ConnectionConfig) -> ConnectionError {
             ConnectionError::Timeout(cfg.timeout_secs)
         }
         russh::Error::IO(io) => ConnectionError::Io(io),
-        russh::Error::UnknownKey => ConnectionError::HostKeyMismatch,
+        russh::Error::UnknownKey => match change {
+            Some(change) => ConnectionError::HostKeyMismatch(change),
+            None => ConnectionError::SshError("server host key was rejected".to_string()),
+        },
         other => ConnectionError::SshError(other.to_string()),
     }
 }
@@ -495,6 +535,9 @@ async fn write_private_key(path: &Path, pem: &str) -> Result<(), std::io::Error>
 pub(crate) struct ClientHandler {
     known_hosts_path: PathBuf,
     matched_existing: bool,
+    /// Filled in when a pinned key is refused, so `connect` can report the
+    /// old and new fingerprints instead of a bare "unknown key".
+    mismatch: Arc<Mutex<Option<HostKeyChange>>>,
 }
 
 #[async_trait]
@@ -528,6 +571,13 @@ impl Handler for ClientHandler {
                         tracing::error!(
                             "host key mismatch for algo {algo}: pinned {stored}, server presented {fingerprint} — refusing to connect"
                         );
+                        if let Ok(mut slot) = self.mismatch.lock() {
+                            *slot = Some(HostKeyChange {
+                                algorithm: algo.to_string(),
+                                pinned: stored,
+                                presented: fingerprint,
+                            });
+                        }
                         Ok(false)
                     }
                     None => {
@@ -570,6 +620,64 @@ fn find_pinned_fingerprint(existing: &str, algo: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Replace the pinned key for `change.algorithm` with the presented one.
+///
+/// Only call this after the user has explicitly confirmed the change. It
+/// refuses if the file no longer holds the fingerprint that was reported as
+/// pinned, so a stale confirmation can never overwrite a different key.
+pub fn repin_host_key(
+    known_hosts_path: &Path,
+    change: &HostKeyChange,
+) -> Result<(), ConnectionError> {
+    let existing = std::fs::read_to_string(known_hosts_path)?;
+    if find_pinned_fingerprint(&existing, &change.algorithm).as_deref() != Some(&change.pinned) {
+        return Err(ConnectionError::SshError(
+            "pinned host key changed since the mismatch was reported; not re-pinning".to_string(),
+        ));
+    }
+    let updated = replace_pinned_fingerprint(&existing, &change.algorithm, &change.presented);
+    let tmp = known_hosts_path.with_extension("tmp");
+    std::fs::write(&tmp, updated)?;
+    std::fs::rename(&tmp, known_hosts_path)?;
+    // warn! so the change is recorded at every log level, including Production.
+    tracing::warn!(
+        algorithm = %change.algorithm,
+        old_fingerprint = %change.pinned_display(),
+        new_fingerprint = %change.presented_display(),
+        "host key re-pinned after user confirmation"
+    );
+    Ok(())
+}
+
+/// Rewrite the entry for `algo` (including a legacy bare-fingerprint line)
+/// to `<algo> <fingerprint>`, leaving every other line untouched.
+fn replace_pinned_fingerprint(existing: &str, algo: &str, fingerprint: &str) -> String {
+    let mut out = String::new();
+    let mut replaced = false;
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        let is_target = !replaced
+            && !trimmed.is_empty()
+            && !trimmed.starts_with('#')
+            && {
+                let mut parts = trimmed.split_whitespace();
+                let first = parts.next().unwrap_or("");
+                parts.next().is_none_or(|_| first == algo)
+            };
+        if is_target {
+            out.push_str(&format!("{algo} {fingerprint}\n"));
+            replaced = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !replaced {
+        out.push_str(&format!("{algo} {fingerprint}\n"));
+    }
+    out
 }
 
 fn write_fingerprint(
@@ -763,7 +871,117 @@ mod tests {
     #[test]
     fn map_connect_err_maps_unknown_key_to_host_key_mismatch() {
         let cfg = ConnectionConfig::default();
-        let mapped = map_connect_err(russh::Error::UnknownKey, &cfg);
-        assert!(matches!(mapped, ConnectionError::HostKeyMismatch));
+        let change = HostKeyChange {
+            algorithm: "ssh-ed25519".into(),
+            pinned: "old".into(),
+            presented: "new".into(),
+        };
+        let mapped = map_connect_err(russh::Error::UnknownKey, &cfg, Some(change.clone()));
+        assert!(matches!(mapped, ConnectionError::HostKeyMismatch(c) if c == change));
+    }
+
+    fn test_handler(path: &Path) -> (ClientHandler, Arc<Mutex<Option<HostKeyChange>>>) {
+        let mismatch = Arc::new(Mutex::new(None));
+        (
+            ClientHandler {
+                known_hosts_path: path.to_path_buf(),
+                matched_existing: false,
+                mismatch: mismatch.clone(),
+            },
+            mismatch,
+        )
+    }
+
+    fn fresh_key() -> russh_key::PublicKey {
+        russh_key::KeyPair::generate_ed25519().clone_public_key().unwrap()
+    }
+
+    #[tokio::test]
+    async fn first_connect_pins_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let key = fresh_key();
+        let (mut h, mismatch) = test_handler(&path);
+        assert!(h.check_server_key(&key).await.unwrap());
+        let pinned = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(pinned.trim(), format!("{} {}", key.name(), key.fingerprint()));
+        assert!(mismatch.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn matching_key_connects() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let key = fresh_key();
+        test_handler(&path).0.check_server_key(&key).await.unwrap();
+        let (mut h, mismatch) = test_handler(&path);
+        assert!(h.check_server_key(&key).await.unwrap());
+        assert!(h.matched_existing);
+        assert!(mismatch.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn mismatched_key_is_refused_and_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let old = fresh_key();
+        let new = fresh_key();
+        test_handler(&path).0.check_server_key(&old).await.unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let (mut h, mismatch) = test_handler(&path);
+        assert!(!h.check_server_key(&new).await.unwrap());
+        let change = mismatch.lock().unwrap().clone().expect("change recorded");
+        assert_eq!(change.pinned, old.fingerprint());
+        assert_eq!(change.presented, new.fingerprint());
+        assert!(change.presented_display().starts_with("SHA256:"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn confirmed_repin_then_connects() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let old = fresh_key();
+        let new = fresh_key();
+        test_handler(&path).0.check_server_key(&old).await.unwrap();
+        let (mut h, mismatch) = test_handler(&path);
+        assert!(!h.check_server_key(&new).await.unwrap());
+        let change = mismatch.lock().unwrap().clone().unwrap();
+
+        repin_host_key(&path, &change).unwrap();
+
+        let (mut h, _) = test_handler(&path);
+        assert!(h.check_server_key(&new).await.unwrap());
+        let (mut h, _) = test_handler(&path);
+        assert!(!h.check_server_key(&old).await.unwrap());
+    }
+
+    #[test]
+    fn repin_refuses_when_file_changed_since_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        std::fs::write(&path, "ssh-ed25519 other\n").unwrap();
+        let change = HostKeyChange {
+            algorithm: "ssh-ed25519".into(),
+            pinned: "old".into(),
+            presented: "new".into(),
+        };
+        assert!(repin_host_key(&path, &change).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ssh-ed25519 other\n");
+    }
+
+    #[test]
+    fn replace_pinned_fingerprint_keeps_other_algorithms() {
+        let out = replace_pinned_fingerprint("ssh-ed25519 a\nssh-rsa b\n", "ssh-ed25519", "c");
+        assert_eq!(out, "ssh-ed25519 c\nssh-rsa b\n");
+        let legacy = replace_pinned_fingerprint("a\n", "ssh-ed25519", "c");
+        assert_eq!(legacy, "ssh-ed25519 c\n");
+    }
+
+    #[test]
+    fn sha256_display_adds_prefix_once() {
+        assert_eq!(sha256_display("abc"), "SHA256:abc");
+        assert_eq!(sha256_display("SHA256:abc"), "SHA256:abc");
     }
 }
