@@ -463,7 +463,7 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::AppConfig;
-use crate::device::connection::DeviceConnection;
+use crate::device::connection::{ConnectionError, DeviceConnection, HostKeyChange};
 use crate::sync::scanner::{scan_local, scan_remote_with_progress, ScanProgress};
 use crate::sync::transfer::{
     delete_local_document, delete_remote_document, pull_batch, push_batch, reload_xochitl,
@@ -490,6 +490,9 @@ pub enum SyncProgressEvent {
     TransferProgress(TransferProgress),
     ConflictResolved(ConflictNotification),
     Error(String),
+    /// The device presented a different SSH host key than the pinned one.
+    /// The connection was refused; the UI decides whether to re-pin.
+    HostKeyMismatch(HostKeyChange),
     Complete(SyncReport),
 }
 
@@ -567,6 +570,9 @@ impl SyncOrchestrator {
         if let Err(e) = self.connection.connect().await {
             let msg = format!("connect failed: {e}");
             tracing::error!(error = format!("{e:#}"), "could not connect to device");
+            if let ConnectionError::HostKeyMismatch(change) = &e {
+                callback(SyncProgressEvent::HostKeyMismatch(change.clone()));
+            }
             callback(SyncProgressEvent::Error(msg.clone()));
             report.errors.push(msg);
             report.duration_ms = start.elapsed().as_millis() as u64;

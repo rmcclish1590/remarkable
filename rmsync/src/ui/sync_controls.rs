@@ -14,7 +14,7 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::config::AppConfig;
-use crate::device::connection::{AuthMethod, DeviceConnection};
+use crate::device::connection::{repin_host_key, AuthMethod, DeviceConnection, HostKeyChange};
 use crate::sync::transfer::TransferProgress;
 
 /// Wire the Browse button to a folder-chooser dialog. The returned entry is
@@ -117,6 +117,93 @@ fn show_error_dialog_with_heading(
     dialog.set_default_response(Some("ok"));
     dialog.connect_response(None, |d, _| d.close());
     dialog.present();
+}
+
+/// Explain a refused connection caused by a changed SSH host key. Nothing is
+/// trusted unless the user picks "Trust New Key…" and then confirms a second
+/// dialog; closing or cancelling either leaves the old key pinned. `on_trusted`
+/// runs only after the new key has been written to `known_hosts_path`.
+pub fn show_host_key_mismatch_dialog<F: Fn() + 'static>(
+    window: &adw::ApplicationWindow,
+    change: HostKeyChange,
+    known_hosts_path: std::path::PathBuf,
+    on_trusted: F,
+) {
+    let dialog = adw::MessageDialog::builder()
+        .transient_for(window)
+        .modal(true)
+        .heading("Your reMarkable's identity changed")
+        .body(format!(
+            "rmsync refused to connect because the tablet is presenting a different \
+             security key than the one it remembered. This is expected after a \
+             reMarkable software update or a factory reset, but it can also mean a \
+             different device or someone on the network is impersonating your tablet.\n\n\
+             Remembered key:\n{}\n\nKey the device is presenting now:\n{}",
+            change.pinned_display(),
+            change.presented_display()
+        ))
+        .build();
+    dialog.add_response("cancel", "_Keep Refusing");
+    dialog.add_response("trust", "_Trust New Key…");
+    dialog.set_response_appearance("trust", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    let window = window.clone();
+    let on_trusted = Rc::new(on_trusted);
+    dialog.connect_response(None, move |d, response| {
+        d.close();
+        if response != "trust" {
+            return;
+        }
+        confirm_host_key_trust(
+            &window,
+            change.clone(),
+            known_hosts_path.clone(),
+            on_trusted.clone(),
+        );
+    });
+    dialog.present();
+}
+
+fn confirm_host_key_trust<F: Fn() + 'static>(
+    window: &adw::ApplicationWindow,
+    change: HostKeyChange,
+    known_hosts_path: std::path::PathBuf,
+    on_trusted: Rc<F>,
+) {
+    let confirm = adw::MessageDialog::builder()
+        .transient_for(window)
+        .modal(true)
+        .heading("Trust the new key?")
+        .body(format!(
+            "Only continue if the key below matches the one shown on your tablet \
+             (or you just updated or reset it). Trusting an unknown key lets an \
+             attacker read and change your documents.\n\n{}",
+            change.presented_display()
+        ))
+        .build();
+    confirm.add_response("cancel", "_Cancel");
+    confirm.add_response("trust", "_Replace Remembered Key");
+    confirm.set_response_appearance("trust", adw::ResponseAppearance::Destructive);
+    confirm.set_default_response(Some("cancel"));
+    confirm.set_close_response("cancel");
+
+    let window = window.clone();
+    confirm.connect_response(None, move |d, response| {
+        d.close();
+        if response != "trust" {
+            return;
+        }
+        match repin_host_key(&known_hosts_path, &change) {
+            Ok(()) => on_trusted(),
+            Err(e) => {
+                tracing::error!(error = %e, "could not re-pin host key");
+                show_error_dialog_with_heading(&window, "Could not update the key", &e.to_string());
+            }
+        }
+    });
+    confirm.present();
 }
 
 /// Ensure the path entry reflects the current config value and that the
