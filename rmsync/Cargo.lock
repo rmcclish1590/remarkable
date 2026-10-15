@@ -2168,6 +2168,7 @@ dependencies = [
  "tracing-subscriber",
  "udev",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
