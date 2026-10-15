@@ -14,6 +14,8 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::config::AppConfig;
+use crate::sync::cleanup;
+use crate::sync::state_db::StateDb;
 use crate::logging::{LogHandle, LogLevel, MAX_LOG_BYTES, MAX_LOG_FILES};
 
 /// Build and present the settings dialog.
@@ -103,8 +105,148 @@ pub fn present_settings(
     group.add(&limits);
 
     page.add(&group);
+    page.add(&library_group(&window, config));
     window.add(&page);
     window.present();
+}
+
+/// "Library" group: one-off cleanup of the "(conflict ...)" duplicates that
+/// earlier versions of the sync created (MCC-104). Nothing changes until the
+/// user has seen the list and confirmed it.
+fn library_group(
+    window: &adw::PreferencesWindow,
+    config: Rc<RefCell<AppConfig>>,
+) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder().title("Library").build();
+    let row = adw::ActionRow::builder()
+        .title("Clean up conflict duplicates")
+        .subtitle(
+            "Find “(conflict YYYY-MM-DD)” copies left by earlier syncs. \
+             You review the list first; removed copies are kept in a backup folder.",
+        )
+        .build();
+    let button = gtk::Button::builder()
+        .label("Review…")
+        .valign(gtk::Align::Center)
+        .build();
+    row.add_suffix(&button);
+    row.set_activatable_widget(Some(&button));
+
+    let window = window.clone();
+    button.connect_clicked(move |b| {
+        let sync_dir = config.borrow().sync.sync_dir.clone();
+        b.set_sensitive(false);
+        let (window, button) = (window.clone(), b.clone());
+        gtk::glib::spawn_future_local(async move {
+            let dir = sync_dir.clone();
+            let planned = gtk::gio::spawn_blocking(move || cleanup::plan_cleanup(&dir)).await;
+            match planned {
+                Ok(Ok(findings)) if findings.is_empty() => {
+                    message(&window, "Nothing to clean up", "No conflict duplicates were found.");
+                    button.set_sensitive(true);
+                }
+                Ok(Ok(findings)) => confirm_cleanup(&window, &button, sync_dir, findings),
+                Ok(Err(e)) => {
+                    tracing::error!(error = format!("{e:#}"), "conflict duplicate scan failed");
+                    message(&window, "Scan failed", &format!("{e:#}"));
+                    button.set_sensitive(true);
+                }
+                Err(_) => button.set_sensitive(true),
+            }
+        });
+    });
+    group.add(&row);
+    group
+}
+
+fn confirm_cleanup(
+    window: &adw::PreferencesWindow,
+    button: &gtk::Button,
+    sync_dir: std::path::PathBuf,
+    findings: Vec<cleanup::DuplicateFinding>,
+) {
+    let list = findings.iter().map(|f| format!("• {}", f.describe())).collect::<Vec<_>>().join("\n");
+    let label = gtk::Label::builder()
+        .label(&list)
+        .wrap(true)
+        .xalign(0.0)
+        .selectable(true)
+        .build();
+    let scroller = gtk::ScrolledWindow::builder()
+        .child(&label)
+        .min_content_height(120)
+        .max_content_height(320)
+        .propagate_natural_height(true)
+        .build();
+
+    let dialog = adw::MessageDialog::builder()
+        .transient_for(window)
+        .modal(true)
+        .heading(format!("Remove {} conflict duplicate(s)?", findings.len()))
+        .body(
+            "Nothing is deleted: each duplicate is moved to the backup folder. The next sync \
+             also removes it from your reMarkable.",
+        )
+        .extra_child(&scroller)
+        .build();
+    dialog.add_response("cancel", "_Cancel");
+    dialog.add_response("clean", "_Clean up");
+    dialog.set_response_appearance("clean", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    let (window, button) = (window.clone(), button.clone());
+    dialog.connect_response(None, move |_, response| {
+        if response != "clean" {
+            tracing::info!("conflict duplicate cleanup cancelled");
+            button.set_sensitive(true);
+            return;
+        }
+        let (window, button) = (window.clone(), button.clone());
+        let (sync_dir, findings) = (sync_dir.clone(), findings.clone());
+        gtk::glib::spawn_future_local(async move {
+            // rusqlite is !Sync, so the DB is opened on the worker thread.
+            let result = gtk::gio::spawn_blocking(move || -> anyhow::Result<cleanup::CleanupReport> {
+                let db_path = sync_dir.join(".rmsync").join("state.db");
+                if let Some(parent) = db_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let db = StateDb::open(&db_path)?;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                Ok(cleanup::apply_cleanup(&sync_dir, &db, &findings, now))
+            })
+            .await;
+            match result {
+                Ok(Ok(report)) if report.errors.is_empty() => {
+                    message(&window, "Cleanup complete", &report.summary())
+                }
+                Ok(Ok(report)) => message(
+                    &window,
+                    "Cleanup finished with errors",
+                    &format!("{}\n\n{}", report.summary(), report.errors.join("\n")),
+                ),
+                Ok(Err(e)) => message(&window, "Cleanup failed", &format!("{e:#}")),
+                Err(_) => {}
+            }
+            button.set_sensitive(true);
+        });
+    });
+    dialog.present();
+}
+
+fn message(window: &adw::PreferencesWindow, heading: &str, body: &str) {
+    let dialog = adw::MessageDialog::builder()
+        .transient_for(window)
+        .modal(true)
+        .heading(heading)
+        .body(body)
+        .build();
+    dialog.add_response("ok", "_OK");
+    dialog.set_default_response(Some("ok"));
+    dialog.present();
 }
 
 #[cfg(test)]
