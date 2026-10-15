@@ -93,13 +93,30 @@ pub struct CPage {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+impl CPage {
+    /// Pages the user deleted stay listed in `cPages` with a `deleted`
+    /// marker, but the tablet removes their `.rm` file.
+    pub fn is_deleted(&self) -> bool {
+        self.extra
+            .get("deleted")
+            .and_then(|d| d.get("value"))
+            .and_then(|v| v.as_i64())
+            == Some(1)
+    }
+}
+
 impl RemarkableContent {
-    /// Return ordered page UUIDs from either the modern `cPages` format or
-    /// the legacy flat `pages` array.
+    /// Return ordered UUIDs of the live pages from either the modern
+    /// `cPages` format or the legacy flat `pages` array. Pages marked
+    /// deleted in `cPages` are left out.
     pub fn page_ids(&self) -> Vec<String> {
         if let Some(cp) = &self.c_pages {
             if let Some(pages) = &cp.pages {
-                return pages.iter().map(|p| p.id.clone()).collect();
+                return pages
+                    .iter()
+                    .filter(|p| !p.is_deleted())
+                    .map(|p| p.id.clone())
+                    .collect();
             }
         }
         self.pages.clone().unwrap_or_default()
@@ -270,6 +287,31 @@ mod tests {
         assert_eq!(c.page_count, Some(3));
         assert!(c.pages.is_none());
         assert!(c.c_pages.is_some());
+    }
+
+    #[test]
+    fn page_ids_skips_deleted_pages_trailing_and_middle() {
+        let json = r#"{
+            "cPages": { "pages": [
+                { "id": "a", "idx": { "timestamp": "1:1", "value": "a" } },
+                { "id": "gone-mid", "deleted": { "timestamp": "1:1", "value": 1 } },
+                { "id": "b" },
+                { "id": "gone-last", "deleted": { "timestamp": "2:1", "value": 1 } }
+            ] },
+            "fileType": "notebook", "formatVersion": 2
+        }"#;
+        let c: RemarkableContent = serde_json::from_str(json).unwrap();
+        assert_eq!(c.page_ids(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn page_ids_keeps_page_with_deleted_marker_set_to_zero() {
+        let json = r#"{
+            "cPages": { "pages": [ { "id": "a", "deleted": { "timestamp": "1:1", "value": 0 } } ] },
+            "fileType": "notebook", "formatVersion": 2
+        }"#;
+        let c: RemarkableContent = serde_json::from_str(json).unwrap();
+        assert_eq!(c.page_ids(), vec!["a"]);
     }
 
     #[test]

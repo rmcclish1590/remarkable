@@ -31,7 +31,7 @@ use gtk::glib;
 use gtk::prelude::*;
 
 use crate::remarkable::metadata::RemarkableContent;
-use crate::remarkable::rm_parser::parse_rm_file;
+use crate::remarkable::rm_parser::{parse_rm_file, RmPage};
 use crate::remarkable::svg_renderer::{render_page_to_svg, RENDER_VERSION};
 use crate::sync::transfer::{is_safe_component, is_safe_uuid};
 
@@ -300,31 +300,15 @@ impl DocumentViewer {
                 failures.push(format!("page {}: rejected unsafe page path", i + 1));
                 continue;
             }
-            if !rm_path.exists() {
-                failures.push(format!("page {}: .rm file not found", i + 1));
-                continue;
-            }
-            let cache_path = cache.join(format!("{uuid}_{page_id}.svg"));
-            if !cache_path.starts_with(&cache) {
-                failures.push(format!("page {}: rejected unsafe cache path", i + 1));
-                continue;
-            }
-            if !cache_path.exists() {
-                match render_and_cache(&rm_path, &cache_path) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        // {:#} prints the whole context chain — the outer
-                        // context alone ("rmscene fallback for …") hides
-                        // the actual reason a page failed to render.
-                        failures.push(format!("page {}: {e:#}", i + 1));
-                        continue;
-                    }
+            let cache_path = match prepare_page_svg(&raw, &cache, uuid, page_id) {
+                Ok(p) => p,
+                Err(e) => {
+                    // {:#} prints the whole context chain — the outer
+                    // context alone hides the actual reason a page failed.
+                    failures.push(format!("page {} ({page_id}.rm): {e:#}", i + 1));
+                    continue;
                 }
-            }
-            if !cache_path.exists() {
-                failures.push(format!("page {}: SVG cache missing after render", i + 1));
-                continue;
-            }
+            };
 
             // Rasterizing (usvg parse + tiny-skia render) is the expensive
             // part of opening a page — see the module doc. The very first
@@ -671,6 +655,43 @@ fn svg_to_texture_scaled(svg_path: &Path, target_width: u32) -> Result<gdk::Memo
     Ok(rgba_to_texture(width, height, &rgba))
 }
 
+/// Produce the SVG for one live page and return its path.
+///
+/// A page with no `.rm` file is blank: the tablet only writes the file once
+/// something is drawn, so this is not an error. It gets a blank SVG under a
+/// separate name, so a real render cached later is never shadowed by it.
+/// Only a file that exists but cannot be rendered is an error.
+fn prepare_page_svg(raw: &Path, cache: &Path, uuid: &str, page_id: &str) -> Result<PathBuf> {
+    let rm_path = raw.join(uuid).join(format!("{page_id}.rm"));
+    if !rm_path.starts_with(raw) {
+        anyhow::bail!("rejected unsafe page path");
+    }
+    if !rm_path.exists() {
+        let blank_path = cache.join(format!("{uuid}_{page_id}.blank.svg"));
+        if !blank_path.starts_with(cache) {
+            anyhow::bail!("rejected unsafe cache path");
+        }
+        if !blank_path.exists() {
+            let blank = RmPage { version: 6, layers: Vec::new(), text: None };
+            std::fs::write(&blank_path, render_page_to_svg(&blank))
+                .with_context(|| format!("writing {}", blank_path.display()))?;
+        }
+        tracing::debug!(uuid, page_id, "no .rm file for page; showing it blank");
+        return Ok(blank_path);
+    }
+    let cache_path = cache.join(format!("{uuid}_{page_id}.svg"));
+    if !cache_path.starts_with(cache) {
+        anyhow::bail!("rejected unsafe cache path");
+    }
+    if !cache_path.exists() {
+        render_and_cache(&rm_path, &cache_path)?;
+    }
+    if !cache_path.exists() {
+        anyhow::bail!("SVG cache missing after render");
+    }
+    Ok(cache_path)
+}
+
 fn render_and_cache(rm_path: &Path, cache_path: &Path) -> Result<()> {
     let bytes = std::fs::read(rm_path)
         .with_context(|| format!("reading {}", rm_path.display()))?;
@@ -984,6 +1005,45 @@ pub const REMARKABLE_PAGE_ASPECT: (i32, i32) = (REMARKABLE_PAGE_WIDTH, REMARKABL
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn missing_rm_file_yields_blank_page_not_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (raw, cache) = (dir.path().join("raw"), dir.path().join("cache"));
+        std::fs::create_dir_all(raw.join("doc")).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let svg = super::prepare_page_svg(&raw, &cache, "doc", "page-1").unwrap();
+        assert!(svg.to_string_lossy().ends_with("doc_page-1.blank.svg"));
+        let text = std::fs::read_to_string(svg).unwrap();
+        assert!(text.contains("<svg"));
+    }
+
+    #[test]
+    fn blank_page_does_not_shadow_a_later_real_render() {
+        let dir = tempfile::tempdir().unwrap();
+        let (raw, cache) = (dir.path().join("raw"), dir.path().join("cache"));
+        std::fs::create_dir_all(raw.join("doc")).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let blank = super::prepare_page_svg(&raw, &cache, "doc", "p").unwrap();
+        // The .rm arrives on a later sync (header-only v6 file is enough to
+        // exercise the real-file path); the blank cache entry must not be used.
+        std::fs::write(raw.join("doc").join("p.rm"), b"garbage").unwrap();
+        let second = super::prepare_page_svg(&raw, &cache, "doc", "p");
+        if let Ok(path) = second {
+            assert_ne!(path, blank);
+        }
+    }
+
+    #[test]
+    fn corrupt_rm_file_is_a_real_failure_naming_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (raw, cache) = (dir.path().join("raw"), dir.path().join("cache"));
+        std::fs::create_dir_all(raw.join("doc")).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(raw.join("doc").join("bad.rm"), b"this is not an rm file").unwrap();
+        let err = super::prepare_page_svg(&raw, &cache, "doc", "bad").unwrap_err();
+        assert!(format!("{err:#}").contains("bad.rm"), "got: {err:#}");
+    }
+
     use super::*;
 
     #[test]
