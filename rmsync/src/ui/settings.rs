@@ -105,9 +105,37 @@ pub fn present_settings(
     group.add(&limits);
 
     page.add(&group);
+    page.add(&connection_group(parent, config.clone()));
     page.add(&library_group(&window, config));
     window.add(&page);
     window.present();
+}
+
+/// "Connection" group: guided setup of a new SSH key and pinned host key.
+fn connection_group(
+    parent: &adw::ApplicationWindow,
+    config: Rc<RefCell<AppConfig>>,
+) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder().title("Connection").build();
+    let row = adw::ActionRow::builder()
+        .title("Set up new connection")
+        .subtitle(
+            "Create a new SSH key and trust the tablet's current identity. Use this \
+             after a software update, factory reset or host key warning.",
+        )
+        .activatable(true)
+        .build();
+    let button = gtk::Button::builder()
+        .label("Set Up…")
+        .valign(gtk::Align::Center)
+        .build();
+    row.add_suffix(&button);
+    let parent = parent.clone();
+    button.connect_clicked(move |_| {
+        crate::ui::connection_setup::present_connection_setup(&parent, config.clone(), || {});
+    });
+    group.add(&row);
+    group
 }
 
 /// "Library" group: one-off cleanup of the "(conflict ...)" duplicates that

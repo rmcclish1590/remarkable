@@ -75,11 +75,25 @@ pub fn sha256_display(fingerprint: &str) -> String {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum AuthMethod {
     Password(String),
     KeyFile(PathBuf),
 }
+
+// Hand-written so a `{:?}` of a config can never put the password in a log.
+impl std::fmt::Debug for AuthMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthMethod::Password(_) => f.write_str("Password(<redacted>)"),
+            AuthMethod::KeyFile(p) => f.debug_tuple("KeyFile").field(p).finish(),
+        }
+    }
+}
+
+/// Message carried by `ConnectionError::AuthFailed` when the device refuses
+/// the offered credentials (as opposed to a local key-handling failure).
+pub const REJECTED_CREDENTIALS: &str = "server rejected credentials";
 
 #[derive(Debug, Clone)]
 pub struct ConnectionConfig {
@@ -120,6 +134,15 @@ pub struct DeviceConnection {
     session: Option<Handle<ClientHandler>>,
     sftp: Option<SftpSession>,
     config: ConnectionConfig,
+}
+
+impl Drop for DeviceConnection {
+    fn drop(&mut self) {
+        // Don't leave a setup password sitting in freed memory.
+        if let AuthMethod::Password(pw) = &mut self.config.auth {
+            zeroize::Zeroize::zeroize(pw);
+        }
+    }
 }
 
 impl DeviceConnection {
@@ -219,9 +242,7 @@ impl DeviceConnection {
                 method = auth_kind,
                 "device rejected credentials"
             );
-            return Err(ConnectionError::AuthFailed(
-                "server rejected credentials".to_string(),
-            ));
+            return Err(ConnectionError::AuthFailed(REJECTED_CREDENTIALS.to_string()));
         }
 
         let channel = session
@@ -449,7 +470,7 @@ impl DeviceConnection {
     }
 }
 
-fn map_connect_err(
+pub(crate) fn map_connect_err(
     e: russh::Error,
     cfg: &ConnectionConfig,
     change: Option<HostKeyChange>,
@@ -484,7 +505,7 @@ fn systemtime_to_unix(t: Option<std::time::SystemTime>) -> u64 {
         .unwrap_or(0)
 }
 
-fn public_key_path(private: &Path) -> PathBuf {
+pub(crate) fn public_key_path(private: &Path) -> PathBuf {
     let mut p = private.to_path_buf();
     let fname = p
         .file_name()
@@ -719,6 +740,12 @@ mod tests {
         assert_eq!(cfg.username, DEFAULT_USERNAME);
         assert_eq!(cfg.timeout_secs, DEFAULT_TIMEOUT_SECS);
         matches!(cfg.auth, AuthMethod::Password(_));
+    }
+
+    #[test]
+    fn auth_method_debug_never_shows_password() {
+        let dbg = format!("{:?}", AuthMethod::Password("hunter2".into()));
+        assert!(!dbg.contains("hunter2"));
     }
 
     #[test]

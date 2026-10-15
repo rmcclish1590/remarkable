@@ -123,11 +123,12 @@ fn show_error_dialog_with_heading(
 /// trusted unless the user picks "Trust New Key…" and then confirms a second
 /// dialog; closing or cancelling either leaves the old key pinned. `on_trusted`
 /// runs only after the new key has been written to `known_hosts_path`.
-pub fn show_host_key_mismatch_dialog<F: Fn() + 'static>(
+pub fn show_host_key_mismatch_dialog<F: Fn() + 'static, S: Fn() + 'static>(
     window: &adw::ApplicationWindow,
     change: HostKeyChange,
     known_hosts_path: std::path::PathBuf,
     on_trusted: F,
+    on_setup_new: S,
 ) {
     let dialog = adw::MessageDialog::builder()
         .transient_for(window)
@@ -144,6 +145,7 @@ pub fn show_host_key_mismatch_dialog<F: Fn() + 'static>(
         ))
         .build();
     dialog.add_response("cancel", "_Keep Refusing");
+    dialog.add_response("setup", "Set Up New _Connection…");
     dialog.add_response("trust", "_Trust New Key…");
     dialog.set_response_appearance("trust", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("cancel"));
@@ -153,6 +155,10 @@ pub fn show_host_key_mismatch_dialog<F: Fn() + 'static>(
     let on_trusted = Rc::new(on_trusted);
     dialog.connect_response(None, move |d, response| {
         d.close();
+        if response == "setup" {
+            on_setup_new();
+            return;
+        }
         if response != "trust" {
             return;
         }

@@ -293,7 +293,7 @@ fn start_sync(
                 SyncProgressEvent::HostKeyMismatch(change) => {
                     saw_error = true;
                     let known_hosts = config.borrow().to_connection_config().known_hosts_path;
-                    let retry = {
+                    let retry = Rc::new({
                         let (window, controls, browser, label, config) = (
                             window.clone(),
                             controls.clone(),
@@ -310,9 +310,22 @@ fn start_sync(
                                 config.clone(),
                             )
                         }
+                    });
+                    let retry_fn = retry.clone();
+                    let retry = move || retry_fn();
+                    let setup_new = {
+                        let (window, config) = (window.clone(), config.clone());
+                        let retry = retry.clone();
+                        move || {
+                            crate::ui::connection_setup::present_connection_setup(
+                                &window,
+                                config.clone(),
+                                retry.clone(),
+                            )
+                        }
                     };
                     crate::ui::sync_controls::show_host_key_mismatch_dialog(
-                        &window, change, known_hosts, retry,
+                        &window, change, known_hosts, retry.clone(), setup_new,
                     );
                 }
                 SyncProgressEvent::Complete(report) => {
