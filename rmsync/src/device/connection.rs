@@ -399,7 +399,11 @@ impl DeviceConnection {
     /// Execute a command on the device and wait for its exit status. Returns
     /// the exit code on completion, or an error if the channel/SSH layer
     /// faults. Stdout/stderr are discarded.
-    pub async fn exec(&mut self, command: &str) -> Result<u32, ConnectionError> {
+    ///
+    /// Every command is logged at INFO with the reason it is being run, so a
+    /// user can tell exactly what rmsync did to the device.
+    pub async fn exec(&mut self, command: &str, reason: &str) -> Result<u32, ConnectionError> {
+        tracing::info!(command, reason, host = %self.config.host, "running command on device");
         let session = self
             .session
             .as_mut()

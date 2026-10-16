@@ -395,6 +395,7 @@ fn phase_label(phase: &SyncPhase) -> &'static str {
         SyncPhase::Pulling => "Pulling documents...",
         SyncPhase::Pushing => "Pushing documents...",
         SyncPhase::Deleting => "Applying deletes...",
+        SyncPhase::RestartingDeviceUi => "Refreshing the reMarkable screen...",
         SyncPhase::Finalizing => "Finalising...",
     }
 }

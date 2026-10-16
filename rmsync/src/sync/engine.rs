@@ -317,6 +317,31 @@ fn classify(
     }
 }
 
+/// Whether the tablet's UI should be restarted after this sync.
+///
+/// Only when something was actually written to the device, and only if the
+/// user has not turned it off. A pull-only or unchanged sync never restarts.
+/// This reads what was *done*, not what was planned: a push that failed wrote
+/// nothing and must not restart the UI (that is what made the tablet appear to
+/// reboot on every sync).
+pub fn should_restart_ui(device_writes: usize, enabled: bool) -> bool {
+    enabled && device_writes > 0
+}
+
+/// How recently the tablet must have saved a page for it to count as "being
+/// used" and have its UI restart deferred.
+pub const DEVICE_BUSY_WINDOW_SECS: u64 = 120;
+
+/// True if any document on the device was modified within the busy window of
+/// `device_now`: the user is probably writing, and a UI restart could lose
+/// what they have not saved.
+pub fn device_recently_edited(remote: &RemoteManifest, device_now: u64, window_secs: u64) -> bool {
+    remote
+        .documents
+        .iter()
+        .any(|d| d.mtime <= device_now && device_now - d.mtime <= window_secs)
+}
+
 /// Baselines to record for documents both sides already agree on.
 ///
 /// A `Skip` leaves no state row behind, so the next one-sided change to a
@@ -590,6 +615,7 @@ pub enum SyncPhase {
     Pulling,
     Pushing,
     Deleting,
+    RestartingDeviceUi,
     ResolvingConflicts,
     Finalizing,
 }
@@ -621,6 +647,10 @@ pub struct SyncReport {
     /// Deletions held back because they need the user's confirmation.
     pub deletes_pending: Vec<PlannedDelete>,
     pub conflicts_resolved: usize,
+    /// Files-level changes made on the device this run: pushes, deletions
+    /// and conflicts won by the desktop. Drives whether the UI is restarted.
+    pub device_writes: usize,
+    pub device_ui_restarted: bool,
     pub errors: Vec<String>,
     /// Things that did not stop the sync but the user should know about.
     pub warnings: Vec<String>,
@@ -864,6 +894,10 @@ impl SyncOrchestrator {
             let (resolutions, errors) =
                 resolve_all_conflicts(&self.connection, &plan, &local, &remote, &sync_dir, &self.db, clock_offset).await;
             report.conflicts_resolved = resolutions.len();
+            report.device_writes += resolutions
+                .iter()
+                .filter(|r| matches!(r.winner, ConflictWinner::Local))
+                .count();
             tracing::info!(resolved = resolutions.len(), failed = errors.len(), "two-sided changes processed");
             for r in resolutions {
                 callback(SyncProgressEvent::ConflictResolved(r.to_notification()));
@@ -914,6 +948,7 @@ impl SyncOrchestrator {
             {
                 Ok(results) => {
                     report.pushed = results.iter().filter(|r| r.success).count();
+                    report.device_writes += report.pushed;
                     tracing::info!(
                         pushed = report.pushed,
                         failed = results.len() - report.pushed,
@@ -989,6 +1024,7 @@ impl SyncOrchestrator {
                                 let _ = self.db.delete_state(&action.uuid);
                                 report.deleted += 1;
                                 report.deleted_remote += 1;
+                                report.device_writes += 1;
                             }
                             Err(e) => {
                                 tracing::error!(uuid = %action.uuid, error = format!("{e:#}"), "remote delete failed");
@@ -1006,10 +1042,38 @@ impl SyncOrchestrator {
             }
         }
 
-        // 9. Reload xochitl
-        if (plan.total_push > 0 || report.deleted_remote > 0 || plan.total_conflict > 0)
-            && !self.cancel.is_cancelled() {
-            let _ = reload_xochitl(&mut self.connection).await;
+        // 9. Reload xochitl, only if this sync actually changed the device.
+        if should_restart_ui(report.device_writes, self.config.sync.restart_device_ui)
+            && !self.cancel.is_cancelled()
+        {
+            let device_now = (now_secs() as i64 + clock_offset).max(0) as u64;
+            if device_recently_edited(&remote, device_now, DEVICE_BUSY_WINDOW_SECS) {
+                tracing::warn!(
+                    writes = report.device_writes,
+                    "device was edited moments ago; not restarting its UI"
+                );
+                report.warnings.push(
+                    "The reMarkable was in use, so its screen was not restarted to avoid losing unsaved work. \
+                     Synced changes will appear the next time its interface restarts."
+                        .to_string(),
+                );
+            } else {
+                callback(SyncProgressEvent::Phase(SyncPhase::RestartingDeviceUi));
+                tracing::info!(
+                    writes = report.device_writes,
+                    "restarting the device UI (xochitl) to show changes"
+                );
+                match reload_xochitl(&mut self.connection).await {
+                    Ok(()) => report.device_ui_restarted = true,
+                    Err(e) => tracing::warn!(error = format!("{e:#}"), "restarting the device UI failed"),
+                }
+            }
+        } else {
+            tracing::debug!(
+                writes = report.device_writes,
+                enabled = self.config.sync.restart_device_ui,
+                "no device UI restart needed"
+            );
         }
 
         Ok(self.finalise(start, report, &callback).await)
@@ -1577,6 +1641,39 @@ mod tests {
         let plan = compute_sync_plan_from_parts(&l, &r, &states);
         assert_eq!(plan.actions.len(), 1);
         assert_eq!(plan.total_skip, 1);
+    }
+
+    // ---- device UI restart (MCC-111) ----
+
+    #[test]
+    fn restart_only_when_something_was_written_and_enabled() {
+        assert!(!should_restart_ui(0, true), "pull-only or unchanged sync");
+        assert!(should_restart_ui(1, true));
+        assert!(!should_restart_ui(5, false), "user turned it off");
+    }
+
+    fn remote_edited_at(mtime: u64) -> RemoteManifest {
+        RemoteManifest {
+            documents: vec![remote("a", "h", "DocumentType")]
+                .into_iter()
+                .map(|mut d| {
+                    d.mtime = mtime;
+                    d
+                })
+                .collect(),
+            scanned_at: 0,
+            total_documents: 1,
+            total_size_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn a_device_edited_moments_ago_is_considered_busy() {
+        assert!(device_recently_edited(&remote_edited_at(990), 1000, DEVICE_BUSY_WINDOW_SECS));
+        assert!(!device_recently_edited(&remote_edited_at(100), 1000, DEVICE_BUSY_WINDOW_SECS));
+        assert!(!device_recently_edited(&RemoteManifest {
+            documents: vec![], scanned_at: 0, total_documents: 0, total_size_bytes: 0
+        }, 1000, DEVICE_BUSY_WINDOW_SECS));
     }
 
     // ---- push fixes (MCC-110) ----
