@@ -123,6 +123,52 @@ fn show_error_dialog_with_heading(
 /// trusted unless the user picks "Trust New Key…" and then confirms a second
 /// dialog; closing or cancelling either leaves the old key pinned. `on_trusted`
 /// runs only after the new key has been written to `known_hosts_path`.
+/// Body text for the delete confirmation: how many, then one line per
+/// document naming the side it would be removed from. Long lists are cut so
+/// the dialog stays usable; the full list is in the log.
+pub fn format_delete_list(deletes: &[crate::sync::engine::PlannedDelete]) -> String {
+    const SHOWN: usize = 25;
+    let mut s = format!(
+        "This sync would delete {} document(s). A copy of each is kept under \
+         .rmsync/backups before it is removed.\n\n",
+        deletes.len()
+    );
+    for d in deletes.iter().take(SHOWN) {
+        s.push_str(&format!("• {}\n", d.describe()));
+    }
+    if deletes.len() > SHOWN {
+        s.push_str(&format!("…and {} more (see the log)\n", deletes.len() - SHOWN));
+    }
+    s
+}
+
+/// Ask before a sync deletes more than it may unattended. `on_confirm` runs
+/// only on an explicit "Delete"; closing or skipping leaves everything in place.
+pub fn show_delete_confirmation_dialog<F: Fn() + 'static>(
+    window: &adw::ApplicationWindow,
+    deletes: &[crate::sync::engine::PlannedDelete],
+    on_confirm: F,
+) {
+    let dialog = adw::MessageDialog::builder()
+        .transient_for(window)
+        .modal(true)
+        .heading("Delete these documents?")
+        .body(format_delete_list(deletes))
+        .build();
+    dialog.add_response("skip", "_Don't Delete");
+    dialog.add_response("delete", "_Delete");
+    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("skip"));
+    dialog.set_close_response("skip");
+    dialog.connect_response(None, move |d, response| {
+        d.close();
+        if response == "delete" {
+            on_confirm();
+        }
+    });
+    dialog.present();
+}
+
 pub fn show_host_key_mismatch_dialog<F: Fn() + 'static, S: Fn() + 'static>(
     window: &adw::ApplicationWindow,
     change: HostKeyChange,
@@ -677,5 +723,18 @@ mod tests {
             !config_path.exists(),
             "a failed directory setup must not persist the new path"
         );
+    }
+
+    #[test]
+    fn delete_list_names_each_document_and_side_and_truncates() {
+        use crate::sync::engine::{DeleteSide, PlannedDelete};
+        let many: Vec<PlannedDelete> = (0..30)
+            .map(|i| PlannedDelete { uuid: format!("u{i}"), name: format!("Doc {i}"), side: DeleteSide::Remote })
+            .collect();
+        let text = format_delete_list(&many);
+        assert!(text.contains("delete 30 document(s)"));
+        assert!(text.contains("“Doc 0” — from the reMarkable"));
+        assert!(!text.contains("Doc 29"));
+        assert!(text.contains("and 5 more"));
     }
 }
