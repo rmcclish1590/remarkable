@@ -761,6 +761,31 @@ pub async fn execute_conflict_resolution(
     Ok(())
 }
 
+/// Copy `uuid`'s local files into `backup_dir`, then remove them from `raw/`.
+/// If the backup fails nothing is removed.
+pub fn backup_and_delete_local_document(uuid: &str, sync_dir: &Path, backup_dir: &Path) -> Result<()> {
+    if !is_safe_uuid(uuid) {
+        anyhow::bail!("refusing to delete unsafe uuid {uuid:?}");
+    }
+    copy_local_to_backup(&sync_dir.join(RAW_SUBDIR), uuid, backup_dir)?;
+    delete_local_document(uuid, sync_dir)
+}
+
+/// Download the device's copy of `uuid` into `backup_dir`, then delete it from
+/// the device. If the backup fails nothing is deleted.
+pub async fn backup_and_delete_remote_document(
+    conn: &DeviceConnection,
+    uuid: &str,
+    sync_dir: &Path,
+    backup_dir: &Path,
+) -> Result<()> {
+    if !is_safe_uuid(uuid) {
+        anyhow::bail!("refusing to delete unsafe uuid {uuid:?}");
+    }
+    download_remote_to_backup(conn, uuid, &sync_dir.join(RAW_SUBDIR), backup_dir).await?;
+    delete_remote_document(conn, uuid).await
+}
+
 /// Root of all conflict backups. Lives beside the state DB, outside `raw/`.
 pub fn backup_root(sync_dir: &Path) -> PathBuf {
     sync_dir.join(".rmsync").join("backups")
@@ -1196,5 +1221,26 @@ mod tests {
         let order: Vec<&str> = upload_order(&files).iter().map(|(_, r)| r.as_str()).collect();
         assert_eq!(order.last(), Some(&"u.metadata"));
         assert_eq!(order.len(), 3);
+    }
+
+    #[test]
+    fn local_delete_keeps_a_backup_and_refuses_unsafe_uuids() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("raw");
+        std::fs::create_dir_all(raw.join("abc")).unwrap();
+        std::fs::write(raw.join("abc.metadata"), b"meta").unwrap();
+        std::fs::write(raw.join("abc/p1.rm"), b"page").unwrap();
+        let backup = backup_root(dir.path()).join("deleted-test/abc");
+
+        backup_and_delete_local_document("abc", dir.path(), &backup).unwrap();
+
+        assert!(!raw.join("abc.metadata").exists());
+        assert!(!raw.join("abc").exists());
+        assert_eq!(std::fs::read(backup.join("abc.metadata")).unwrap(), b"meta");
+        assert_eq!(std::fs::read(backup.join("abc/p1.rm")).unwrap(), b"page");
+
+        std::fs::write(raw.join("keep.metadata"), b"x").unwrap();
+        assert!(backup_and_delete_local_document("../raw", dir.path(), &backup).is_err());
+        assert!(raw.join("keep.metadata").exists());
     }
 }

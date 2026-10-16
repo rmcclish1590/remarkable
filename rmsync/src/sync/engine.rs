@@ -72,6 +72,110 @@ impl SyncPlan {
     }
 }
 
+/// Which side a deletion is applied to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteSide {
+    /// Removed from the computer's sync folder.
+    Local,
+    /// Removed from the reMarkable.
+    Remote,
+}
+
+impl DeleteSide {
+    pub fn label(self) -> &'static str {
+        match self {
+            DeleteSide::Local => "computer",
+            DeleteSide::Remote => "reMarkable",
+        }
+    }
+}
+
+/// A deletion the plan wants to perform, named for the confirmation list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedDelete {
+    pub uuid: String,
+    pub name: String,
+    pub side: DeleteSide,
+}
+
+impl PlannedDelete {
+    pub fn describe(&self) -> String {
+        format!("“{}” — from the {}", self.name, self.side.label())
+    }
+}
+
+/// When a plan's deletions must be confirmed by the user first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeletePolicy {
+    pub max_count: usize,
+    pub max_percent: usize,
+}
+
+impl Default for DeletePolicy {
+    fn default() -> Self {
+        Self { max_count: 5, max_percent: 10 }
+    }
+}
+
+impl DeletePolicy {
+    /// True when `deletes` removals out of a `library` of documents is more
+    /// than may proceed unattended.
+    pub fn requires_confirmation(&self, deletes: usize, library: usize) -> bool {
+        deletes > self.max_count || deletes * 100 > self.max_percent * library
+    }
+}
+
+impl SyncPlan {
+    /// Deletions that remove a document from one side. `DeleteBoth` is left out:
+    /// neither side still has the document, so only the state row goes.
+    pub fn planned_deletes(&self) -> Vec<PlannedDelete> {
+        self.actions
+            .iter()
+            .filter_map(|a| {
+                let side = match a.action_type {
+                    SyncActionType::DeleteLocal => DeleteSide::Local,
+                    SyncActionType::DeleteRemote => DeleteSide::Remote,
+                    _ => return None,
+                };
+                Some(PlannedDelete { uuid: a.uuid.clone(), name: a.visible_name.clone(), side })
+            })
+            .collect()
+    }
+}
+
+/// Smallest synced library for which a scan that lost most of it is suspicious.
+const SANITY_MIN_BASELINE: usize = 10;
+
+/// Refuse to plan from a scan that looks broken rather than treat every
+/// missing document as a deletion.
+///
+/// An empty scan against a non-empty baseline is always suspect. The device
+/// listing is additionally held to "did not lose more than half": nothing the
+/// app does removes most of the device's library in one go, whereas the local
+/// folder can legitimately shrink a lot (the duplicate cleanup does exactly
+/// that) and is covered by the delete confirmation instead.
+pub fn check_scan_sanity(local_docs: usize, remote_docs: usize, baseline_docs: usize) -> Option<String> {
+    if baseline_docs >= 3 && remote_docs == 0 {
+        return Some(format!(
+            "The reMarkable returned no documents, but {baseline_docs} were synced before. \
+             Nothing was changed; check the device and try again."
+        ));
+    }
+    if baseline_docs >= SANITY_MIN_BASELINE && remote_docs * 2 < baseline_docs {
+        return Some(format!(
+            "The reMarkable returned only {remote_docs} documents, but {baseline_docs} were synced before. \
+             Nothing was changed; the device listing may be incomplete."
+        ));
+    }
+    if baseline_docs >= 3 && local_docs == 0 {
+        return Some(format!(
+            "The sync folder contains no documents, but {baseline_docs} were synced before. \
+             Nothing was changed; check that the sync folder is the right one and is mounted."
+        ));
+    }
+    None
+}
+
 /// Compute the sync plan by diffing local, remote, and synced states.
 pub fn compute_sync_plan(
     local: &LocalManifest,
@@ -472,9 +576,9 @@ use crate::config::AppConfig;
 use crate::device::connection::{ConnectionError, DeviceConnection, HostKeyChange};
 use crate::sync::scanner::{scan_local, scan_remote_with_progress, ScanProgress};
 use crate::sync::transfer::{
-    delete_local_document, delete_remote_document, estimate_clock_offset, pull_batch, push_batch,
-    reload_xochitl,
-    resolve_all_conflicts, TransferProgress,
+    backup_and_delete_local_document, backup_and_delete_remote_document, backup_root,
+    estimate_clock_offset, pull_batch, push_batch, reload_xochitl, resolve_all_conflicts,
+    TransferProgress,
 };
 
 #[derive(Debug, Clone)]
@@ -500,6 +604,9 @@ pub enum SyncProgressEvent {
     /// The device presented a different SSH host key than the pinned one.
     /// The connection was refused; the UI decides whether to re-pin.
     HostKeyMismatch(HostKeyChange),
+    /// The plan deletes more than may proceed unattended. Nothing was deleted;
+    /// the UI asks, and re-runs the sync with deletions approved if confirmed.
+    DeleteConfirmationNeeded(Vec<PlannedDelete>),
     Complete(SyncReport),
 }
 
@@ -508,6 +615,11 @@ pub struct SyncReport {
     pub pulled: usize,
     pub pushed: usize,
     pub deleted: usize,
+    /// Of `deleted`, how many were removed from the computer / the reMarkable.
+    pub deleted_local: usize,
+    pub deleted_remote: usize,
+    /// Deletions held back because they need the user's confirmation.
+    pub deletes_pending: Vec<PlannedDelete>,
     pub conflicts_resolved: usize,
     pub errors: Vec<String>,
     /// Things that did not stop the sync but the user should know about.
@@ -517,12 +629,23 @@ pub struct SyncReport {
 
 impl SyncReport {
     pub fn summary(&self) -> String {
+        let deleted = if self.deleted == 0 {
+            "0 deleted".to_string()
+        } else {
+            format!(
+                "{} deleted ({} from computer, {} from reMarkable)",
+                self.deleted, self.deleted_local, self.deleted_remote
+            )
+        };
         let mut s = format!(
-            "Sync complete: {} pulled, {} pushed, {} deleted, {} conflicts",
-            self.pulled, self.pushed, self.deleted, self.conflicts_resolved
+            "Sync complete: {} pulled, {} pushed, {deleted}, {} conflicts",
+            self.pulled, self.pushed, self.conflicts_resolved
         );
         for w in &self.warnings {
             s.push_str(&format!("\n{w}"));
+        }
+        if !self.deletes_pending.is_empty() {
+            s.push_str(&format!("; {} deletion(s) awaiting confirmation", self.deletes_pending.len()));
         }
         s
     }
@@ -533,6 +656,7 @@ pub struct SyncOrchestrator {
     pub db: StateDb,
     pub connection: DeviceConnection,
     pub cancel: CancellationToken,
+    deletes_approved: bool,
 }
 
 impl SyncOrchestrator {
@@ -548,7 +672,14 @@ impl SyncOrchestrator {
             db,
             connection,
             cancel: CancellationToken::new(),
+            deletes_approved: false,
         })
+    }
+
+    /// Let this run apply deletions without asking again, because the user
+    /// has already seen the list and confirmed it.
+    pub fn approve_deletes(&mut self) {
+        self.deletes_approved = true;
     }
 
     pub fn cancellation_token(&self) -> CancellationToken {
@@ -664,6 +795,25 @@ impl SyncOrchestrator {
             }
         };
 
+        // A scan that came back empty or far smaller than last time more likely
+        // failed than reflects a real change; planning from it would turn
+        // every "missing" document into a deletion.
+        let baseline_docs = match self.db.get_all_states() {
+            Ok(states) => states.iter().filter(|s| s.synced_hash.is_some()).count(),
+            Err(_) => 0,
+        };
+        if let Some(msg) = check_scan_sanity(local.total_documents, remote.total_documents, baseline_docs) {
+            tracing::error!(
+                local = local.total_documents,
+                remote = remote.total_documents,
+                baseline = baseline_docs,
+                "scan result looks incomplete; aborting before any change"
+            );
+            callback(SyncProgressEvent::Error(msg.clone()));
+            report.errors.push(msg);
+            return Ok(self.finalise(start, report, &callback).await);
+        }
+
         // 4. Compute diff
         callback(SyncProgressEvent::Phase(SyncPhase::ComputingDiff));
         let plan = match compute_sync_plan(&local, &remote, &self.db) {
@@ -672,7 +822,8 @@ impl SyncOrchestrator {
                     pull = p.total_pull,
                     push = p.total_push,
                     delete = p.total_delete,
-                    conflicts = p.has_conflicts(),
+                    conflicts = p.total_conflict,
+                    skip = p.total_skip,
                     "sync plan computed"
                 );
                 p
@@ -703,8 +854,8 @@ impl SyncOrchestrator {
             }
             Err(e) => tracing::warn!(error = format!("{e:#}"), "reading sync state failed"),
         }
-        for a in &plan.actions {
-            tracing::debug!(uuid = %a.uuid, name = %a.visible_name, action = ?a.action_type, "sync decision");
+        for a in plan.actionable() {
+            tracing::debug!(uuid = %a.uuid, name = %a.visible_name, action = ?a.action_type, "planned action");
         }
 
         // 5. Resolve conflicts
@@ -785,48 +936,70 @@ impl SyncOrchestrator {
         }
 
         // 8. Deletes
-        if plan.total_delete > 0 && !self.cancel.is_cancelled() {
+        let planned = plan.planned_deletes();
+        let policy = DeletePolicy::default();
+        let held_back = self.config.sync.confirm_deletes
+            && !self.deletes_approved
+            && policy.requires_confirmation(planned.len(), plan.actions.len());
+        if held_back && !self.cancel.is_cancelled() {
+            tracing::warn!(
+                count = planned.len(),
+                library = plan.actions.len(),
+                "deletions exceed the unattended limit; waiting for confirmation"
+            );
+            for d in &planned {
+                tracing::info!(uuid = %d.uuid, name = %d.name, side = d.side.label(), "deletion awaiting confirmation");
+            }
+            report.deletes_pending = planned.clone();
+            callback(SyncProgressEvent::DeleteConfirmationNeeded(planned.clone()));
+        } else if plan.total_delete > 0 && !self.cancel.is_cancelled() {
             callback(SyncProgressEvent::Phase(SyncPhase::Deleting));
             // Deletions are the only destructive step and the hardest to
             // reconstruct after the fact, so each one is logged at INFO
-            // with its uuid — a user who loses a document needs to be able
-            // to see whether rmSync removed it, and from which side.
-            tracing::info!(count = plan.total_delete, "applying deletions");
+            // with its uuid and side, and the document is copied to
+            // `.rmsync/backups/deleted-*` before it is removed.
+            let backup_dir = backup_root(&sync_dir)
+                .join(format!("deleted-{}-{}", conflict_date_string(now_secs()), now_secs()));
+            tracing::info!(
+                count = planned.len(),
+                backup = %backup_dir.display(),
+                "applying deletions"
+            );
             for action in plan.actions.iter() {
+                let doc_backup = backup_dir.join(&action.uuid);
                 match &action.action_type {
                     SyncActionType::DeleteLocal => {
-                        tracing::info!(uuid = %action.uuid, side = "local", "deleting document");
-                        if let Err(e) = delete_local_document(&action.uuid, &sync_dir) {
-                            tracing::error!(
-                                uuid = %action.uuid,
-                                error = format!("{e:#}"),
-                                "local delete failed"
-                            );
-                            report.errors.push(format!("delete local {}: {e}", action.uuid));
-                        } else {
-                            let _ = self.db.delete_state(&action.uuid);
-                            report.deleted += 1;
+                        tracing::info!(uuid = %action.uuid, name = %action.visible_name, side = "local", "deleting document");
+                        match backup_and_delete_local_document(&action.uuid, &sync_dir, &doc_backup) {
+                            Ok(()) => {
+                                let _ = self.db.delete_state(&action.uuid);
+                                report.deleted += 1;
+                                report.deleted_local += 1;
+                            }
+                            Err(e) => {
+                                tracing::error!(uuid = %action.uuid, error = format!("{e:#}"), "local delete failed");
+                                report.errors.push(format!("delete local {}: {e}", action.uuid));
+                            }
                         }
                     }
                     SyncActionType::DeleteRemote => {
-                        tracing::info!(uuid = %action.uuid, side = "remote", "deleting document");
-                        if let Err(e) = delete_remote_document(&self.connection, &action.uuid).await {
-                            tracing::error!(
-                                uuid = %action.uuid,
-                                error = format!("{e:#}"),
-                                "remote delete failed"
-                            );
-                            report.errors.push(format!("delete remote {}: {e}", action.uuid));
-                        } else {
-                            let _ = self.db.delete_state(&action.uuid);
-                            report.deleted += 1;
+                        tracing::info!(uuid = %action.uuid, name = %action.visible_name, side = "remote", "deleting document");
+                        match backup_and_delete_remote_document(&self.connection, &action.uuid, &sync_dir, &doc_backup).await {
+                            Ok(()) => {
+                                let _ = self.db.delete_state(&action.uuid);
+                                report.deleted += 1;
+                                report.deleted_remote += 1;
+                            }
+                            Err(e) => {
+                                tracing::error!(uuid = %action.uuid, error = format!("{e:#}"), "remote delete failed");
+                                report.errors.push(format!("delete remote {}: {e}", action.uuid));
+                            }
                         }
                     }
                     SyncActionType::DeleteBoth => {
-                        let _ = delete_local_document(&action.uuid, &sync_dir);
-                        let _ = delete_remote_document(&self.connection, &action.uuid).await;
+                        // Neither side has it any more; only the stale row goes.
+                        tracing::info!(uuid = %action.uuid, name = %action.visible_name, "dropping state of document gone from both sides");
                         let _ = self.db.delete_state(&action.uuid);
-                        report.deleted += 1;
                     }
                     _ => {}
                 }
@@ -834,7 +1007,7 @@ impl SyncOrchestrator {
         }
 
         // 9. Reload xochitl
-        if (plan.total_push > 0 || plan.total_delete > 0 || plan.total_conflict > 0)
+        if (plan.total_push > 0 || report.deleted_remote > 0 || plan.total_conflict > 0)
             && !self.cancel.is_cancelled() {
             let _ = reload_xochitl(&mut self.connection).await;
         }
@@ -859,6 +1032,8 @@ impl SyncOrchestrator {
                 pulled = report.pulled,
                 pushed = report.pushed,
                 deleted = report.deleted,
+                deleted_local = report.deleted_local,
+                deleted_remote = report.deleted_remote,
                 conflicts_resolved = report.conflicts_resolved,
                 duration_ms = report.duration_ms,
                 "sync finished"
@@ -1427,5 +1602,90 @@ mod tests {
     fn warnings_appear_in_the_summary() {
         let r = SyncReport { warnings: vec!["Could not measure the clock".into()], ..Default::default() };
         assert!(r.summary().contains("Could not measure the clock"));
+    }
+
+    // ---- deletion safeguards (MCC-109) ----
+
+    fn plan_of(actions: Vec<(&str, SyncActionType)>) -> SyncPlan {
+        let mut plan = SyncPlan::default();
+        for (uuid, t) in actions {
+            if matches!(t, SyncActionType::DeleteLocal | SyncActionType::DeleteRemote | SyncActionType::DeleteBoth) {
+                plan.total_delete += 1;
+            }
+            plan.actions.push(SyncAction {
+                uuid: uuid.into(),
+                visible_name: format!("doc {uuid}"),
+                action_type: t,
+                priority: 1,
+            });
+        }
+        plan
+    }
+
+    #[test]
+    fn empty_device_listing_aborts_instead_of_planning_deletions() {
+        let msg = check_scan_sanity(79, 0, 79).expect("must abort");
+        assert!(msg.contains("no documents"));
+    }
+
+    #[test]
+    fn device_listing_that_lost_most_of_the_library_aborts() {
+        assert!(check_scan_sanity(79, 30, 79).is_some());
+        assert!(check_scan_sanity(79, 40, 79).is_none(), "just over half is believable");
+    }
+
+    #[test]
+    fn empty_sync_folder_aborts_but_a_shrunken_one_is_left_to_confirmation() {
+        assert!(check_scan_sanity(0, 79, 79).is_some());
+        assert!(check_scan_sanity(17, 89, 89).is_none(), "cleanup legitimately shrinks the folder");
+    }
+
+    #[test]
+    fn first_sync_and_tiny_libraries_never_trip_the_sanity_check() {
+        assert!(check_scan_sanity(0, 79, 0).is_none());
+        assert!(check_scan_sanity(0, 0, 0).is_none());
+        assert!(check_scan_sanity(1, 1, 2).is_none());
+    }
+
+    #[test]
+    fn plan_over_the_threshold_requires_confirmation() {
+        let policy = DeletePolicy::default();
+        assert!(policy.requires_confirmation(72, 89));
+        assert!(policy.requires_confirmation(6, 1000), "more than the absolute limit");
+        assert!(policy.requires_confirmation(5, 20), "25% of a small library");
+    }
+
+    #[test]
+    fn normal_small_deletion_proceeds_unattended() {
+        let policy = DeletePolicy::default();
+        assert!(!policy.requires_confirmation(0, 89));
+        assert!(!policy.requires_confirmation(1, 89));
+        assert!(!policy.requires_confirmation(5, 100));
+    }
+
+    #[test]
+    fn planned_deletes_name_the_side_and_skip_delete_both() {
+        let plan = plan_of(vec![
+            ("a", SyncActionType::DeleteLocal),
+            ("b", SyncActionType::DeleteRemote),
+            ("c", SyncActionType::DeleteBoth),
+            ("d", SyncActionType::Pull),
+        ]);
+        let d = plan.planned_deletes();
+        assert_eq!(d.len(), 2);
+        assert_eq!((d[0].uuid.as_str(), d[0].side), ("a", DeleteSide::Local));
+        assert_eq!((d[1].uuid.as_str(), d[1].side), ("b", DeleteSide::Remote));
+        assert!(d[1].describe().contains("reMarkable"));
+    }
+
+    #[test]
+    fn report_summary_shows_which_side_deletions_hit() {
+        let r = SyncReport { deleted: 3, deleted_local: 1, deleted_remote: 2, ..Default::default() };
+        assert!(r.summary().contains("3 deleted (1 from computer, 2 from reMarkable)"));
+        let held = SyncReport {
+            deletes_pending: vec![PlannedDelete { uuid: "a".into(), name: "A".into(), side: DeleteSide::Remote }],
+            ..Default::default()
+        };
+        assert!(held.summary().contains("1 deletion(s) awaiting confirmation"));
     }
 }
