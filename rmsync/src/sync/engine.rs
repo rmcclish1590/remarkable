@@ -274,6 +274,12 @@ fn classify(
             }
         }
         (None, Some(_), None) => SyncActionType::Pull,
+        // A "(conflict …)" copy made by an earlier version exists only on this
+        // computer; pushing it would put the clutter on the device. The
+        // cleanup in settings removes these.
+        (Some(_), None, None) if crate::sync::cleanup::strip_conflict_suffix(&visible_name).is_some() => {
+            SyncActionType::Skip
+        }
         (Some(_), None, None) => SyncActionType::Push,
         (Some(l), Some(r), None) => {
             if l.content_hash == r.content_hash {
@@ -570,8 +576,9 @@ use crate::config::AppConfig;
 use crate::device::connection::{ConnectionError, DeviceConnection, HostKeyChange};
 use crate::sync::scanner::{scan_local, scan_remote_with_progress, ScanProgress};
 use crate::sync::transfer::{
-    backup_and_delete_local_document, backup_and_delete_remote_document, backup_root, pull_batch,
-    push_batch, reload_xochitl, resolve_all_conflicts, TransferProgress,
+    backup_and_delete_local_document, backup_and_delete_remote_document, backup_root,
+    estimate_clock_offset, pull_batch, push_batch, reload_xochitl, resolve_all_conflicts,
+    TransferProgress,
 };
 
 #[derive(Debug, Clone)]
@@ -615,6 +622,8 @@ pub struct SyncReport {
     pub deletes_pending: Vec<PlannedDelete>,
     pub conflicts_resolved: usize,
     pub errors: Vec<String>,
+    /// Things that did not stop the sync but the user should know about.
+    pub warnings: Vec<String>,
     pub duration_ms: u64,
 }
 
@@ -632,6 +641,9 @@ impl SyncReport {
             "Sync complete: {} pulled, {} pushed, {deleted}, {} conflicts",
             self.pulled, self.pushed, self.conflicts_resolved
         );
+        for w in &self.warnings {
+            s.push_str(&format!("\n{w}"));
+        }
         if !self.deletes_pending.is_empty() {
             s.push_str(&format!("; {} deletion(s) awaiting confirmation", self.deletes_pending.len()));
         }
@@ -714,6 +726,21 @@ impl SyncOrchestrator {
         if self.cancel.is_cancelled() {
             return Ok(self.finalise(start, report, &callback).await);
         }
+
+        // The device clock decides which side of a two-sided change is newer,
+        // so measure it up front and say plainly when that is not possible.
+        let clock_offset = match estimate_clock_offset(&self.connection).await {
+            Ok(offset) => offset,
+            Err(e) => {
+                let note = format!(
+                    "Could not measure the reMarkable's clock ({e:#}); file times are compared as-is, \
+                     so which side is newer may be misjudged if the clocks differ."
+                );
+                tracing::warn!(error = format!("{e:#}"), fallback = "offset 0", "could not measure device clock");
+                report.warnings.push(note);
+                0
+            }
+        };
 
         // 2. Scan remote
         callback(SyncProgressEvent::Phase(SyncPhase::ScanningRemote));
@@ -835,7 +862,7 @@ impl SyncOrchestrator {
         if plan.has_conflicts() && !self.cancel.is_cancelled() {
             callback(SyncProgressEvent::Phase(SyncPhase::ResolvingConflicts));
             let (resolutions, errors) =
-                resolve_all_conflicts(&self.connection, &plan, &local, &remote, &sync_dir, &self.db).await;
+                resolve_all_conflicts(&self.connection, &plan, &local, &remote, &sync_dir, &self.db, clock_offset).await;
             report.conflicts_resolved = resolutions.len();
             tracing::info!(resolved = resolutions.len(), failed = errors.len(), "two-sided changes processed");
             for r in resolutions {
@@ -863,7 +890,7 @@ impl SyncOrchestrator {
                     for r in results.iter().filter(|r| !r.success) {
                         if let Some(e) = &r.error {
                             tracing::error!(uuid = %r.uuid, error = %e, "pull failed");
-                            report.errors.push(format!("pull {}: {e}", r.uuid));
+                            report.errors.push(format!("pull “{}”: {e}", name_of(&plan, &r.uuid)));
                         }
                     }
                 }
@@ -895,7 +922,7 @@ impl SyncOrchestrator {
                     for r in results.iter().filter(|r| !r.success) {
                         if let Some(e) = &r.error {
                             tracing::error!(uuid = %r.uuid, error = %e, "push failed");
-                            report.errors.push(format!("push {}: {e}", r.uuid));
+                            report.errors.push(format!("push “{}”: {e}", name_of(&plan, &r.uuid)));
                         }
                     }
                 }
@@ -1025,6 +1052,15 @@ impl SyncOrchestrator {
         callback(SyncProgressEvent::Complete(report.clone()));
         report
     }
+}
+
+/// A document's name for messages, falling back to its uuid.
+fn name_of<'a>(plan: &'a SyncPlan, uuid: &'a str) -> &'a str {
+    plan.actions
+        .iter()
+        .find(|a| a.uuid == uuid)
+        .map(|a| a.visible_name.as_str())
+        .unwrap_or(uuid)
 }
 
 fn action_rank(a: &SyncActionType) -> u8 {
@@ -1541,6 +1577,31 @@ mod tests {
         let plan = compute_sync_plan_from_parts(&l, &r, &states);
         assert_eq!(plan.actions.len(), 1);
         assert_eq!(plan.total_skip, 1);
+    }
+
+    // ---- push fixes (MCC-110) ----
+
+    #[test]
+    fn local_only_conflict_duplicates_are_never_pushed() {
+        let mut l = local("dup", "h", "DocumentType");
+        l.metadata.visible_name = "Home Designs (conflict 2026-10-02)".into();
+        let plan = plan_with(vec![l], vec![], vec![]);
+        assert_eq!(action_for(&plan, "dup").action_type, SyncActionType::Skip);
+        assert_eq!(plan.total_push, 0);
+    }
+
+    #[test]
+    fn ordinary_local_only_documents_still_push_even_with_parentheses() {
+        let mut l = local("new", "h", "DocumentType");
+        l.metadata.visible_name = "Notes (draft)".into();
+        let plan = plan_with(vec![l], vec![], vec![]);
+        assert_eq!(action_for(&plan, "new").action_type, SyncActionType::Push);
+    }
+
+    #[test]
+    fn warnings_appear_in_the_summary() {
+        let r = SyncReport { warnings: vec!["Could not measure the clock".into()], ..Default::default() };
+        assert!(r.summary().contains("Could not measure the clock"));
     }
 
     // ---- deletion safeguards (MCC-109) ----
