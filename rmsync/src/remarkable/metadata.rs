@@ -48,6 +48,9 @@ impl RemarkableMetadata {
         self.doc_type == "DocumentType"
     }
 
+    /// Deleted, or sitting in the tablet's trash. Trash is not a folder: it
+    /// is the special parent `"trash"`, so these items are never synced as
+    /// normal notes and never looked up as a parent folder.
     pub fn is_deleted(&self) -> bool {
         self.deleted || self.parent == "trash"
     }

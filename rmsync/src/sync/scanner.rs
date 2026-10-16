@@ -118,13 +118,27 @@ async fn fetch_missing_parents(
     documents: &mut Vec<RemoteDocumentSnapshot>,
     total_size: &mut u64,
 ) {
+    let mut orphaned_folders = std::collections::HashSet::new();
     for _ in 0..MAX_FOLDER_DEPTH {
         let missing = missing_parent_uuids(documents);
         if missing.is_empty() {
-            return;
+            break;
         }
         let before = documents.len();
         for uuid in missing {
+            // No `<uuid>.metadata` on the device at all: the folder was
+            // deleted and its children left behind. That is a known state,
+            // not a failure — the viewer files them under "Unfiled".
+            if !has_metadata_file(entries, &uuid) {
+                if orphaned_folders.insert(uuid.clone()) {
+                    tracing::debug!(
+                        folder = %uuid,
+                        documents = %referencing_documents(documents, &uuid).join(", "),
+                        "parent folder no longer exists on the device; documents are orphaned"
+                    );
+                }
+                continue;
+            }
             match build_snapshot(conn, &uuid, entries).await {
                 Ok(Some(snap)) => {
                     *total_size += snap.total_size_bytes;
@@ -133,14 +147,44 @@ async fn fetch_missing_parents(
                 // A trashed or unreadable ancestor is not fatal: the children
                 // simply stay at the root, which is what they did before.
                 Ok(None) => tracing::debug!("parent folder {uuid} is deleted; skipping"),
-                Err(e) => tracing::warn!("could not read parent folder {uuid}: {e:#}"),
+                // The folder is listed on the device but unreadable: a true
+                // failure, reported with the documents it affects.
+                Err(e) => tracing::warn!(
+                    folder = %uuid,
+                    documents = %referencing_documents(documents, &uuid).join(", "),
+                    "could not read parent folder: {e:#}"
+                ),
             }
         }
         if documents.len() == before {
-            return; // nothing resolvable; stop rather than spin
+            break; // nothing resolvable; stop rather than spin
         }
     }
-    tracing::warn!("folder nesting exceeded {MAX_FOLDER_DEPTH} levels; tree may be partial");
+    if !orphaned_folders.is_empty() {
+        let affected: usize = orphaned_folders
+            .iter()
+            .map(|f| referencing_documents(documents, f).len())
+            .sum();
+        tracing::info!(
+            folders = orphaned_folders.len(),
+            documents = affected,
+            "documents whose folder was deleted on the device will appear under Unfiled"
+        );
+    }
+}
+
+fn has_metadata_file(entries: &[RemoteFileInfo], uuid: &str) -> bool {
+    let name = format!("{uuid}.metadata");
+    entries.iter().any(|e| e.name == name)
+}
+
+/// `"Name (uuid)"` for every snapshot whose parent is `parent`.
+pub(crate) fn referencing_documents(documents: &[RemoteDocumentSnapshot], parent: &str) -> Vec<String> {
+    documents
+        .iter()
+        .filter(|d| d.metadata.parent == parent)
+        .map(|d| format!("{} ({})", d.metadata.visible_name, d.uuid))
+        .collect()
 }
 
 /// Parent UUIDs referenced by these snapshots that are not themselves present.
@@ -785,6 +829,48 @@ mod tests {
         ))
         .unwrap();
         snap
+    }
+
+    fn entry(name: &str) -> RemoteFileInfo {
+        RemoteFileInfo {
+            name: name.into(),
+            path: format!("{XOCHITL_PATH}/{name}"),
+            size: 1,
+            mtime: 0,
+            is_dir: false,
+        }
+    }
+
+    #[test]
+    fn trash_parent_is_never_looked_up_as_a_folder() {
+        let docs = vec![snap_with_parent("d1", "trash", "DocumentType")];
+        assert!(missing_parent_uuids(&docs).is_empty());
+    }
+
+    #[test]
+    fn orphan_is_told_apart_from_unreadable_folder_by_metadata_file() {
+        let entries = vec![entry("real.metadata"), entry("real.content")];
+        assert!(has_metadata_file(&entries, "real"));
+        assert!(!has_metadata_file(&entries, "gone"));
+    }
+
+    #[test]
+    fn affected_documents_are_named_for_a_parent() {
+        let mut orphan = snap_with_parent("d1", "gone", "DocumentType");
+        orphan.metadata.visible_name = "Meeting Notes".into();
+        let docs = vec![orphan, snap_with_parent("d2", "other", "DocumentType")];
+        assert_eq!(referencing_documents(&docs, "gone"), vec!["Meeting Notes (d1)"]);
+        assert!(referencing_documents(&docs, "nobody").is_empty());
+    }
+
+    #[test]
+    fn nested_folder_parent_is_present_and_not_missing() {
+        let docs = vec![
+            snap_with_parent("top", "", "CollectionType"),
+            snap_with_parent("sub", "top", "CollectionType"),
+            snap_with_parent("d", "sub", "DocumentType"),
+        ];
+        assert!(missing_parent_uuids(&docs).is_empty());
     }
 
     #[test]

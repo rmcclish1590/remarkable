@@ -14,6 +14,11 @@ pub struct DocumentNode {
     pub children: Vec<DocumentNode>,
 }
 
+/// Identifier of the synthetic folder that collects orphaned items. Not a
+/// UUID, so it can never collide with a real item.
+pub const UNFILED_UUID: &str = "unfiled";
+pub const UNFILED_NAME: &str = "Unfiled";
+
 #[derive(Debug)]
 pub struct DocumentTree {
     pub roots: Vec<DocumentNode>,
@@ -52,11 +57,22 @@ impl DocumentTree {
             .filter(|(_, (md, _))| !md.is_deleted())
             .collect();
 
+        // Placement rules for an item's `parent`:
+        //  * empty                      -> top level;
+        //  * a live folder              -> inside it;
+        //  * "trash"                    -> never reaches here (`is_deleted`);
+        //  * anything else (the folder was deleted from the tablet, or its
+        //    metadata never arrived) -> orphan, filed under "Unfiled" so it
+        //    stays visible instead of silently landing among real top-level
+        //    items.
         let mut children_map: HashMap<String, Vec<String>> = HashMap::new();
         let mut root_uuids: Vec<String> = Vec::new();
+        let mut orphan_uuids: Vec<String> = Vec::new();
         for (uuid, (md, _)) in &live {
-            if md.parent.is_empty() || !live.contains_key(&md.parent) {
+            if md.parent.is_empty() {
                 root_uuids.push(uuid.clone());
+            } else if !live.contains_key(&md.parent) {
+                orphan_uuids.push(uuid.clone());
             } else {
                 children_map
                     .entry(md.parent.clone())
@@ -69,6 +85,19 @@ impl DocumentTree {
             .iter()
             .map(|u| build_node(u, &live, &children_map))
             .collect();
+        if !orphan_uuids.is_empty() {
+            let mut children: Vec<DocumentNode> = orphan_uuids
+                .iter()
+                .map(|u| build_node(u, &live, &children_map))
+                .collect();
+            sort_nodes(&mut children);
+            roots.push(DocumentNode {
+                uuid: UNFILED_UUID.to_string(),
+                metadata: unfiled_metadata(),
+                content: None,
+                children,
+            });
+        }
         sort_nodes(&mut roots);
 
         Ok(DocumentTree { roots })
@@ -127,6 +156,23 @@ impl DocumentTree {
         }
         let mut trail = Vec::new();
         walk(&self.roots, uuid, &mut trail).then_some(trail)
+    }
+}
+
+fn unfiled_metadata() -> RemarkableMetadata {
+    RemarkableMetadata {
+        deleted: false,
+        last_modified: "0".to_string(),
+        last_opened: None,
+        last_opened_page: None,
+        metadatamodified: None,
+        modified: None,
+        parent: String::new(),
+        pinned: false,
+        synced: None,
+        doc_type: "CollectionType".to_string(),
+        version: None,
+        visible_name: UNFILED_NAME.to_string(),
     }
 }
 
@@ -218,27 +264,64 @@ mod tests {
     }
 
     #[test]
-    fn documents_flatten_to_root_when_their_folder_is_missing() {
-        // The failure this guards: folder metadata never reached the sync
-        // directory, so every document looked parentless and the tree
-        // collapsed into one alphabetical list.
+    fn orphaned_documents_are_filed_under_unfiled() {
+        // The folder was deleted from the tablet (or its metadata never
+        // arrived): the documents must stay visible, grouped under a named
+        // folder rather than mixed in with real top-level items.
         let td = tempdir().unwrap();
         let p = td.path();
 
         write_meta(p, "doc-1", "absent-folder", "DocumentType", "Notes", false);
         write_meta(p, "doc-2", "absent-folder", "DocumentType", "More", false);
+        write_meta(p, "doc-root", "", "DocumentType", "Alone", false);
 
         let tree = DocumentTree::build_from_directory(p).unwrap();
-        assert_eq!(tree.roots.len(), 2, "both promoted to root");
-        assert_eq!(tree.folder_path("doc-1"), Some(vec![]));
+        assert_eq!(tree.roots.len(), 2);
+        assert_eq!(tree.folder_path("doc-root"), Some(vec![]));
+        assert_eq!(tree.folder_path("doc-1"), Some(vec![UNFILED_NAME]));
+        assert_eq!(tree.folder_path("doc-2"), Some(vec![UNFILED_NAME]));
+        assert_eq!(tree.flat_list().len(), 3, "nothing is lost");
 
-        // With the folder present, the same documents nest under it.
+        // With the folder present, the same documents nest under it and
+        // no Unfiled folder appears.
         write_meta(p, "absent-folder", "", "CollectionType", "Work", false);
         let tree = DocumentTree::build_from_directory(p).unwrap();
-        assert_eq!(tree.roots.len(), 1);
-        assert_eq!(tree.roots[0].uuid, "absent-folder");
+        assert_eq!(tree.roots.len(), 2);
+        assert!(tree.find_by_uuid(UNFILED_UUID).is_none());
         assert_eq!(tree.folder_path("doc-1"), Some(vec!["Work"]));
         assert_eq!(tree.folder_path("doc-2"), Some(vec!["Work"]));
+    }
+
+    #[test]
+    fn no_unfiled_folder_when_nothing_is_orphaned() {
+        let td = tempdir().unwrap();
+        let p = td.path();
+        write_meta(p, "f", "", "CollectionType", "Work", false);
+        write_meta(p, "d", "f", "DocumentType", "Notes", false);
+        let tree = DocumentTree::build_from_directory(p).unwrap();
+        assert!(tree.find_by_uuid(UNFILED_UUID).is_none());
+    }
+
+    #[test]
+    fn trashed_documents_are_not_filed_anywhere() {
+        let td = tempdir().unwrap();
+        let p = td.path();
+        write_meta(p, "t", "trash", "DocumentType", "Trashed", false);
+        write_meta(p, "d", "", "DocumentType", "Kept", false);
+        let tree = DocumentTree::build_from_directory(p).unwrap();
+        assert!(tree.find_by_uuid("t").is_none());
+        assert!(tree.find_by_uuid(UNFILED_UUID).is_none());
+        assert_eq!(tree.flat_list().len(), 1);
+    }
+
+    #[test]
+    fn orphaned_folder_keeps_its_own_children() {
+        let td = tempdir().unwrap();
+        let p = td.path();
+        write_meta(p, "sub", "gone", "CollectionType", "Sub", false);
+        write_meta(p, "deep", "sub", "DocumentType", "Deep", false);
+        let tree = DocumentTree::build_from_directory(p).unwrap();
+        assert_eq!(tree.folder_path("deep"), Some(vec![UNFILED_NAME, "Sub"]));
     }
 
     #[test]
@@ -283,13 +366,14 @@ mod tests {
     }
 
     #[test]
-    fn orphan_parent_goes_to_root() {
+    fn orphan_parent_goes_to_unfiled() {
         let td = tempdir().unwrap();
         let p = td.path();
         write_meta(p, "orphan", "ghost", "DocumentType", "Orphan", false);
         let tree = DocumentTree::build_from_directory(p).unwrap();
         assert_eq!(tree.roots.len(), 1);
-        assert_eq!(tree.roots[0].uuid, "orphan");
+        assert_eq!(tree.roots[0].uuid, UNFILED_UUID);
+        assert_eq!(tree.roots[0].children[0].uuid, "orphan");
     }
 
     #[test]
