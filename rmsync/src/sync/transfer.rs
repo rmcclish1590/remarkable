@@ -380,6 +380,19 @@ pub async fn push_document(
     }
 
     let local_files = local_files_for_uuid(&raw, uuid)?;
+    for (path, rel) in &local_files {
+        if let Err(reason) = validate_device_file(rel, &std::fs::read(path)?) {
+            tracing::error!(uuid, file = %rel, reason, "refusing to upload a malformed file");
+            return Ok(PushResult {
+                uuid: uuid.into(),
+                files_transferred: 0,
+                bytes_transferred: 0,
+                duration_ms: start.elapsed().as_millis() as u64,
+                success: false,
+                error: Some(format!("not uploaded, would risk the device UI: {reason}")),
+            });
+        }
+    }
     tracing::debug!(uuid, files = local_files.len(), "uploading document to device");
     let subdir_remote = format!("{XOCHITL_PATH}/{uuid}");
     if local_files.iter().any(|(_, rel)| rel.starts_with(&format!("{uuid}/"))) {
@@ -599,13 +612,42 @@ pub async fn delete_remote_document(conn: &DeviceConnection, uuid: &str) -> Resu
     Ok(())
 }
 
-/// Ask the reMarkable to reload its document list after a batch of
-/// mutations. Restarting xochitl causes a brief screen refresh — invoke this
-/// once at the end of a sync, not per-file.
+/// Restart the tablet's UI service so documents written to disk appear.
+/// This restarts only `xochitl`, never the device, and ends whatever the user
+/// was doing on screen, so call it once per sync and only after something was
+/// actually written (see `engine::should_restart_ui`).
 pub async fn reload_xochitl(conn: &mut DeviceConnection) -> Result<()> {
-    let status = conn.exec("systemctl restart xochitl").await?;
+    let status = conn
+        .exec(
+            "systemctl restart xochitl",
+            "documents were written to the device and its UI must reload to show them",
+        )
+        .await?;
     if status != 0 {
         tracing::warn!("systemctl restart xochitl exited with {status}");
+    }
+    Ok(())
+}
+
+/// Check a file about to be uploaded so a malformed one cannot be handed to
+/// the device UI. `.metadata` and `.content` must be JSON objects, and
+/// metadata must carry the fields xochitl needs to list the document.
+pub(crate) fn validate_device_file(rel: &str, bytes: &[u8]) -> std::result::Result<(), String> {
+    let is_metadata = rel.ends_with(".metadata");
+    if !is_metadata && !rel.ends_with(".content") {
+        return Ok(());
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| format!("{rel} is not valid JSON: {e}"))?;
+    let Some(obj) = value.as_object() else {
+        return Err(format!("{rel} is not a JSON object"));
+    };
+    if is_metadata {
+        for field in ["visibleName", "type"] {
+            if !obj.get(field).is_some_and(|v| v.is_string()) {
+                return Err(format!("{rel} has no string \"{field}\""));
+            }
+        }
     }
     Ok(())
 }
@@ -1147,5 +1189,18 @@ mod tests {
         assert_eq!(s.parent_uuid, "parent");
         assert_eq!(s.synced_hash.as_deref(), Some("h"));
         assert_eq!(s.last_sync_at, Some(7));
+    }
+
+    #[test]
+    fn malformed_metadata_and_content_are_rejected_before_upload() {
+        let good_meta = br#"{"visibleName":"A","type":"DocumentType","parent":""}"#;
+        assert!(validate_device_file("u.metadata", good_meta).is_ok());
+        assert!(validate_device_file("u.metadata", b"{not json").is_err());
+        assert!(validate_device_file("u.metadata", b"[]").is_err());
+        assert!(validate_device_file("u.metadata", br#"{"type":"DocumentType"}"#).is_err());
+        assert!(validate_device_file("u.metadata", br#"{"visibleName":1,"type":"x"}"#).is_err());
+        assert!(validate_device_file("u.content", b"{}").is_ok());
+        assert!(validate_device_file("u.content", b"").is_err());
+        assert!(validate_device_file("u/p1.rm", b"\x00binary").is_ok(), "pages are not JSON");
     }
 }

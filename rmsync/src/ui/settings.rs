@@ -105,10 +105,43 @@ pub fn present_settings(
     group.add(&limits);
 
     page.add(&group);
+    page.add(&device_group(config.clone()));
     page.add(&connection_group(parent, config.clone()));
     page.add(&library_group(&window, config));
     window.add(&page);
     window.present();
+}
+
+/// "Device" group: whether a sync that changed the tablet restarts its screen.
+fn device_group(config: Rc<RefCell<AppConfig>>) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder().title("Device").build();
+    let row = adw::ActionRow::builder()
+        .title("Refresh the reMarkable screen after changes")
+        .subtitle(
+            "After a sync that adds, changes or removes documents on the tablet, its \
+             interface restarts so they appear. This ends whatever is open on the screen, \
+             so unsaved work there could be lost; it is skipped if the tablet was edited in \
+             the last two minutes and never happens when nothing changed. The tablet itself \
+             is never rebooted.",
+        )
+        .build();
+    let switch = gtk::Switch::builder()
+        .valign(gtk::Align::Center)
+        .active(config.borrow().sync.restart_device_ui)
+        .build();
+    row.add_suffix(&switch);
+    row.set_activatable_widget(Some(&switch));
+    switch.connect_active_notify(move |sw| {
+        let mut cfg = config.borrow_mut();
+        cfg.sync.restart_device_ui = sw.is_active();
+        if let Err(e) = cfg.save() {
+            tracing::error!(error = format!("{e:#}"), "could not save device refresh setting");
+        } else {
+            tracing::info!(enabled = sw.is_active(), "device refresh setting saved");
+        }
+    });
+    group.add(&row);
+    group
 }
 
 /// "Connection" group: guided setup of a new SSH key and pinned host key.

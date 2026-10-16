@@ -57,6 +57,10 @@ pub struct SyncConfig {
     pub auto_sync_on_connect: bool,
     #[serde(default = "default_true")]
     pub confirm_deletes: bool,
+    /// Restart the tablet's UI (xochitl) after a sync that wrote to the
+    /// device, so new and changed documents appear. Never reboots the device.
+    #[serde(default = "default_true")]
+    pub restart_device_ui: bool,
 }
 
 impl Default for SyncConfig {
@@ -65,6 +69,7 @@ impl Default for SyncConfig {
             sync_dir: default_sync_dir(),
             auto_sync_on_connect: false,
             confirm_deletes: true,
+            restart_device_ui: true,
         }
     }
 }
@@ -226,6 +231,7 @@ mod tests {
         assert_eq!(c.device.username, "root");
         assert_eq!(c.device.timeout_secs, 5);
         assert!(c.sync.confirm_deletes);
+        assert!(c.sync.restart_device_ui);
         assert!(!c.sync.auto_sync_on_connect);
         assert_eq!(c.ui.window_width, 1200);
         assert_eq!(c.ui.window_height, 800);
