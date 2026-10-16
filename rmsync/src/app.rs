@@ -80,12 +80,21 @@ impl RmSyncApp {
                 log_handle.clone(),
             );
             load_folder_tree(&main.folder_browser, &cfg);
-            let window_for_delete = main.window.clone();
+            let (window_for_delete, browser_for_delete, controls_for_delete, config_for_delete) = (
+                main.window.clone(),
+                main.folder_browser.clone(),
+                main.sync_controls.clone(),
+                config_for_activate.clone(),
+            );
             main.folder_browser.connect_delete_requested(move |request| {
                 tracing::info!(uuid = %request.uuid, name = %request.name, "delete requested from the list");
-                crate::ui::delete_dialog::present_delete_dialog(&window_for_delete, request, |confirmed| {
-                    // Hand-off point for the delete flow (MCC-115).
-                    tracing::info!(uuid = %confirmed.uuid, name = %confirmed.name, "delete confirmed");
+                let (browser, controls, config) = (
+                    browser_for_delete.clone(),
+                    controls_for_delete.clone(),
+                    config_for_delete.clone(),
+                );
+                crate::ui::delete_dialog::present_delete_dialog(&window_for_delete, request, move |confirmed| {
+                    delete_document(&browser, &controls, &config, confirmed);
                 });
             });
             wire_folder_browser_to_viewer(
@@ -149,6 +158,53 @@ fn wire_settings_button(
         tracing::debug!("opening settings");
         crate::ui::settings::present_settings(&window, config.clone(), log_handle.clone());
     });
+}
+
+/// Carry out a confirmed delete: remove the document locally (recording that
+/// the device copy is owed), refresh the list, and start a sync so the tablet
+/// follows. If no sync can start now, the delete stays queued for the next one.
+fn delete_document(
+    browser: &FolderBrowser,
+    controls: &SyncControls,
+    config: &Rc<RefCell<AppConfig>>,
+    request: crate::ui::folder_browser::DeleteRequest,
+) {
+    if controls.is_syncing() {
+        controls.show_error("A sync is running. Try deleting again when it has finished.");
+        return;
+    }
+    let cfg = config.borrow().clone();
+    let sync_dir = cfg.sync.sync_dir.clone();
+    let db_path = sync_dir.join(".rmsync").join("state.db");
+    let outcome = crate::sync::state_db::StateDb::open(&db_path).and_then(|db| {
+        crate::sync::user_delete::request_delete(&sync_dir, &db, &request.uuid, &request.name, now_unix())
+    });
+    match outcome {
+        Ok(backup) => {
+            tracing::info!(
+                uuid = %request.uuid,
+                name = %request.name,
+                backup = %backup.display(),
+                "document deleted locally; removal from the device is queued"
+            );
+            load_folder_tree(browser, &cfg);
+            if controls.sync_button.is_sensitive() {
+                controls
+                    .status_label
+                    .set_text(&format!("Deleting “{}” from the reMarkable...", request.name));
+                controls.sync_button.emit_clicked();
+            } else {
+                controls.status_label.set_text(&format!(
+                    "“{}” deleted here; it will be removed from the reMarkable at the next sync.",
+                    request.name
+                ));
+            }
+        }
+        Err(e) => {
+            tracing::error!(uuid = %request.uuid, name = %request.name, error = format!("{e:#}"), "delete failed");
+            controls.show_error(&format!("{e:#}"));
+        }
+    }
 }
 
 fn load_folder_tree(browser: &FolderBrowser, config: &AppConfig) {

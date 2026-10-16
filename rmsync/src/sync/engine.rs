@@ -11,6 +11,7 @@ use anyhow::Result;
 
 use crate::sync::scanner::{LocalDocumentSnapshot, LocalManifest, RemoteDocumentSnapshot, RemoteManifest};
 use crate::sync::state_db::{StateDb, SyncFileState, SyncStatus};
+use crate::sync::user_delete::apply_pending_deletes;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncActionType {
@@ -222,28 +223,39 @@ pub fn compute_sync_plan_from_parts(
         actions.push(action);
     }
 
-    actions.sort_by(|a, b| {
-        a.priority
-            .cmp(&b.priority)
-            .then_with(|| action_rank(&a.action_type).cmp(&action_rank(&b.action_type)))
-            .then_with(|| a.uuid.cmp(&b.uuid))
-    });
-
-    let mut plan = SyncPlan::default();
-    for a in &actions {
-        match &a.action_type {
-            SyncActionType::Pull => plan.total_pull += 1,
-            SyncActionType::Push => plan.total_push += 1,
-            SyncActionType::DeleteLocal
-            | SyncActionType::DeleteRemote
-            | SyncActionType::DeleteBoth => plan.total_delete += 1,
-            SyncActionType::Conflict { .. } => plan.total_conflict += 1,
-            SyncActionType::Skip => plan.total_skip += 1,
-        }
-    }
-    plan.actions = actions;
+    let mut plan = SyncPlan { actions, ..Default::default() };
+    plan.finalize();
     plan
 }
+
+impl SyncPlan {
+    /// Order the actions and recompute the totals. Call after changing `actions`.
+    pub fn finalize(&mut self) {
+        self.actions.sort_by(|a, b| {
+            a.priority
+                .cmp(&b.priority)
+                .then_with(|| action_rank(&a.action_type).cmp(&action_rank(&b.action_type)))
+                .then_with(|| a.uuid.cmp(&b.uuid))
+        });
+        self.total_pull = 0;
+        self.total_push = 0;
+        self.total_delete = 0;
+        self.total_conflict = 0;
+        self.total_skip = 0;
+        for a in &self.actions {
+            match &a.action_type {
+                SyncActionType::Pull => self.total_pull += 1,
+                SyncActionType::Push => self.total_push += 1,
+                SyncActionType::DeleteLocal
+                | SyncActionType::DeleteRemote
+                | SyncActionType::DeleteBoth => self.total_delete += 1,
+                SyncActionType::Conflict { .. } => self.total_conflict += 1,
+                SyncActionType::Skip => self.total_skip += 1,
+            }
+        }
+    }
+}
+
 
 fn classify(
     uuid: &str,
@@ -644,6 +656,8 @@ pub struct SyncReport {
     /// Of `deleted`, how many were removed from the computer / the reMarkable.
     pub deleted_local: usize,
     pub deleted_remote: usize,
+    /// Names of documents the user deleted on purpose that are now gone from the device too.
+    pub user_deleted: Vec<String>,
     /// Deletions held back because they need the user's confirmation.
     pub deletes_pending: Vec<PlannedDelete>,
     pub conflicts_resolved: usize,
@@ -671,6 +685,9 @@ impl SyncReport {
             "Sync complete: {} pulled, {} pushed, {deleted}, {} conflicts",
             self.pulled, self.pushed, self.conflicts_resolved
         );
+        if !self.user_deleted.is_empty() {
+            s.push_str(&format!("; removed from the reMarkable: {}", self.user_deleted.join(", ")));
+        }
         for w in &self.warnings {
             s.push_str(&format!("\n{w}"));
         }
@@ -846,7 +863,7 @@ impl SyncOrchestrator {
 
         // 4. Compute diff
         callback(SyncProgressEvent::Phase(SyncPhase::ComputingDiff));
-        let plan = match compute_sync_plan(&local, &remote, &self.db) {
+        let mut plan = match compute_sync_plan(&local, &remote, &self.db) {
             Ok(p) => {
                 tracing::info!(
                     pull = p.total_pull,
@@ -866,6 +883,20 @@ impl SyncOrchestrator {
                 return Ok(self.finalise(start, report, &callback).await);
             }
         };
+
+        // Documents the user deleted on purpose are removed from the device
+        // whatever the diff says, and never pulled back.
+        let pending = self.db.pending_deletes().unwrap_or_else(|e| {
+            tracing::warn!(error = format!("{e:#}"), "could not read queued deletes");
+            Vec::new()
+        });
+        if !pending.is_empty() {
+            for p in &pending {
+                tracing::info!(uuid = %p.uuid, name = %p.name, "applying queued user delete");
+            }
+            apply_pending_deletes(&mut plan, &pending, &remote);
+        }
+        let user_deleted: HashSet<&str> = pending.iter().map(|p| p.uuid.as_str()).collect();
 
         // Adopt documents both sides already agree on, so they are matched by
         // UUID from now on instead of being re-diffed against no baseline.
@@ -971,7 +1002,13 @@ impl SyncOrchestrator {
         }
 
         // 8. Deletes
-        let planned = plan.planned_deletes();
+        // Deletes the user asked for by name were already confirmed; only the
+        // rest count against the unattended limit.
+        let planned: Vec<PlannedDelete> = plan
+            .planned_deletes()
+            .into_iter()
+            .filter(|d| !user_deleted.contains(d.uuid.as_str()))
+            .collect();
         let policy = DeletePolicy::default();
         let held_back = self.config.sync.confirm_deletes
             && !self.deletes_approved
@@ -987,7 +1024,8 @@ impl SyncOrchestrator {
             }
             report.deletes_pending = planned.clone();
             callback(SyncProgressEvent::DeleteConfirmationNeeded(planned.clone()));
-        } else if plan.total_delete > 0 && !self.cancel.is_cancelled() {
+        }
+        if plan.total_delete > 0 && !self.cancel.is_cancelled() {
             callback(SyncProgressEvent::Phase(SyncPhase::Deleting));
             // Deletions are the only destructive step and the hardest to
             // reconstruct after the fact, so each one is logged at INFO
@@ -1002,6 +1040,10 @@ impl SyncOrchestrator {
             );
             for action in plan.actions.iter() {
                 let doc_backup = backup_dir.join(&action.uuid);
+                let by_user = user_deleted.contains(action.uuid.as_str());
+                if held_back && !by_user {
+                    continue;
+                }
                 match &action.action_type {
                     SyncActionType::DeleteLocal => {
                         tracing::info!(uuid = %action.uuid, name = %action.visible_name, side = "local", "deleting document");
@@ -1022,13 +1064,22 @@ impl SyncOrchestrator {
                         match backup_and_delete_remote_document(&self.connection, &action.uuid, &sync_dir, &doc_backup).await {
                             Ok(()) => {
                                 let _ = self.db.delete_state(&action.uuid);
+                                let _ = self.db.clear_pending_delete(&action.uuid);
                                 report.deleted += 1;
                                 report.deleted_remote += 1;
                                 report.device_writes += 1;
+                                if by_user {
+                                    report.user_deleted.push(action.visible_name.clone());
+                                }
                             }
                             Err(e) => {
                                 tracing::error!(uuid = %action.uuid, error = format!("{e:#}"), "remote delete failed");
-                                report.errors.push(format!("delete remote {}: {e}", action.uuid));
+                                // A queued user delete stays queued and is retried next sync.
+                                report.errors.push(format!(
+                                    "delete “{}” from the reMarkable: {e}{}",
+                                    action.visible_name,
+                                    if by_user { " (will retry on the next sync)" } else { "" }
+                                ));
                             }
                         }
                     }
@@ -1036,6 +1087,10 @@ impl SyncOrchestrator {
                         // Neither side has it any more; only the stale row goes.
                         tracing::info!(uuid = %action.uuid, name = %action.visible_name, "dropping state of document gone from both sides");
                         let _ = self.db.delete_state(&action.uuid);
+                        let _ = self.db.clear_pending_delete(&action.uuid);
+                        if by_user {
+                            report.user_deleted.push(action.visible_name.clone());
+                        }
                     }
                     _ => {}
                 }

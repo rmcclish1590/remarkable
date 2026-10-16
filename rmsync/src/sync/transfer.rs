@@ -650,6 +650,19 @@ pub async fn delete_remote_document(conn: &DeviceConnection, uuid: &str) -> Resu
             let _ = conn.delete_file(&e.path).await;
         }
     }
+    // Individual deletes above are best-effort; confirm the document is really
+    // gone so the caller never records a delete that did not happen (which
+    // would let the next sync pull the document straight back).
+    let left: Vec<String> = conn
+        .list_dir(XOCHITL_PATH)
+        .await?
+        .into_iter()
+        .filter(|e| e.name == uuid || e.name.starts_with(&format!("{uuid}.")))
+        .map(|e| e.name)
+        .collect();
+    if !left.is_empty() {
+        anyhow::bail!("{} item(s) for {uuid} are still on the device: {}", left.len(), left.join(", "));
+    }
     Ok(())
 }
 
@@ -835,7 +848,7 @@ pub fn backup_root(sync_dir: &Path) -> PathBuf {
 
 /// Copy every local file for `uuid` into `backup_dir`, keeping the names and
 /// layout they have under `raw/`.
-fn copy_local_to_backup(raw: &Path, uuid: &str, backup_dir: &Path) -> Result<()> {
+pub(crate) fn copy_local_to_backup(raw: &Path, uuid: &str, backup_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(backup_dir)?;
     for (path, rel) in local_files_for_uuid(raw, uuid)? {
         let dest = backup_dir.join(&rel);
