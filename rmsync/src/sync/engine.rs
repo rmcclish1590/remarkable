@@ -750,6 +750,17 @@ impl SyncOrchestrator {
             "sync started"
         );
 
+        // Housekeeping: drop backups of deleted documents past their retention.
+        match crate::sync::user_delete::prune_deleted_backups(
+            &sync_dir,
+            now_secs(),
+            self.config.sync.deleted_backup_retention_days,
+        ) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(removed = n, "pruned old backups of deleted documents"),
+            Err(e) => tracing::warn!(error = format!("{e:#}"), "pruning old backups failed"),
+        }
+
         // 1. Connect
         callback(SyncProgressEvent::Phase(SyncPhase::Connecting));
         tracing::debug!(
@@ -1063,6 +1074,10 @@ impl SyncOrchestrator {
                         tracing::info!(uuid = %action.uuid, name = %action.visible_name, side = "remote", "deleting document");
                         match backup_and_delete_remote_document(&self.connection, &action.uuid, &sync_dir, &doc_backup).await {
                             Ok(()) => {
+                                tracing::info!(
+                                    uuid = %action.uuid, name = %action.visible_name, side = "remote",
+                                    result = "ok", "document removed from the device"
+                                );
                                 let _ = self.db.delete_state(&action.uuid);
                                 let _ = self.db.clear_pending_delete(&action.uuid);
                                 report.deleted += 1;
