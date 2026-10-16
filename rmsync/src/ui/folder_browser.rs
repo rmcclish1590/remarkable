@@ -60,6 +60,12 @@ impl TreeItem {
         matches!(self.item_type, TreeItemType::Folder)
     }
 
+    /// Documents (notebooks, PDFs, EPUBs) can be deleted from the list;
+    /// folders cannot.
+    pub fn is_deletable(&self) -> bool {
+        !self.is_folder()
+    }
+
     pub fn icon_name(&self) -> &'static str {
         match self.item_type {
             TreeItemType::Folder => "folder-symbolic",
@@ -83,6 +89,29 @@ fn classify_node(node: &DocumentNode) -> TreeItemType {
 
 type SelectedCallback = Rc<RefCell<Option<Box<dyn Fn(String)>>>>;
 
+/// A request to delete one document, raised by its row's trash button.
+/// Carries the name exactly as displayed, which the confirmation dialog asks
+/// the user to type back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteRequest {
+    pub uuid: String,
+    pub name: String,
+}
+
+impl DeleteRequest {
+    /// The request a row's trash button raises, or `None` for rows without one.
+    pub fn for_item(item: &TreeItem) -> Option<Self> {
+        item.is_deletable().then(|| DeleteRequest {
+            uuid: item.uuid.clone(),
+            name: item.name.clone(),
+        })
+    }
+}
+
+type DeleteCallback = Rc<RefCell<Option<Box<dyn Fn(DeleteRequest)>>>>;
+
+const DELETE_TOOLTIP: &str = "Delete notebook";
+
 #[derive(Clone)]
 pub struct FolderBrowser {
     pub widget: gtk::Box,
@@ -90,6 +119,7 @@ pub struct FolderBrowser {
     selection: gtk::SingleSelection,
     tree_model: gtk::TreeListModel,
     selected_callback: SelectedCallback,
+    delete_callback: DeleteCallback,
 }
 
 impl FolderBrowser {
@@ -117,8 +147,10 @@ impl FolderBrowser {
         selection.set_autoselect(false);
         selection.set_can_unselect(true);
 
+        let delete_callback: DeleteCallback = Rc::new(RefCell::new(None));
         let factory = gtk::SignalListItemFactory::new();
-        factory.connect_setup(|_, list_item| {
+        let delete_for_setup = delete_callback.clone();
+        factory.connect_setup(move |_, list_item| {
             let list_item = list_item
                 .downcast_ref::<gtk::ListItem>()
                 .expect("ListItem");
@@ -129,11 +161,45 @@ impl FolderBrowser {
             let pages = gtk::Label::new(None);
             name.set_hexpand(true);
             name.set_halign(gtk::Align::Start);
+            // Long names give way with an ellipsis; the page count and the
+            // trash button never shrink or move.
+            name.set_ellipsize(gtk::pango::EllipsizeMode::End);
             pages.set_halign(gtk::Align::End);
+            pages.set_width_chars(8);
+            pages.set_xalign(1.0);
             pages.add_css_class("dim-label");
+
+            let trash = gtk::Button::from_icon_name("user-trash-symbolic");
+            trash.add_css_class("flat");
+            trash.add_css_class("circular");
+            trash.set_valign(gtk::Align::Center);
+            trash.set_tooltip_text(Some(DELETE_TOOLTIP));
+            trash.set_can_focus(true);
+            // The row is recycled, so the click reads whatever item is bound
+            // right now rather than capturing one. A weak ref avoids a cycle
+            // ListItem -> widgets -> closure -> ListItem.
+            let weak_item = list_item.downgrade();
+            let delete_cb = delete_for_setup.clone();
+            trash.connect_clicked(move |_| {
+                let Some(list_item) = weak_item.upgrade() else { return };
+                let Some(boxed) = list_item
+                    .item()
+                    .and_then(|i| i.downcast::<gtk::TreeListRow>().ok())
+                    .and_then(|r| r.item())
+                    .and_then(|i| i.downcast::<BoxedAnyObject>().ok())
+                else {
+                    return;
+                };
+                let request = DeleteRequest::for_item(&boxed.borrow());
+                if let (Some(request), Some(cb)) = (request, delete_cb.borrow().as_ref()) {
+                    cb(request);
+                }
+            });
+
             hbox.append(&icon);
             hbox.append(&name);
             hbox.append(&pages);
+            hbox.append(&trash);
             expander.set_child(Some(&hbox));
             list_item.set_child(Some(&expander));
         });
@@ -183,6 +249,17 @@ impl FolderBrowser {
                     name_label.set_text(&item.name);
                 }
             }
+            let trash = page_label
+                .as_ref()
+                .and_then(|l| l.next_sibling())
+                .and_then(|w| w.downcast::<gtk::Button>().ok());
+            if let Some(trash) = trash {
+                trash.set_visible(item.is_deletable());
+                trash.update_property(&[gtk::accessible::Property::Label(&format!(
+                    "{DELETE_TOOLTIP}: {}",
+                    item.name
+                ))]);
+            }
             if let Some(page_label) = page_label {
                 match item.page_count {
                     Some(n) if n > 0 => page_label.set_text(&format!("{n} pages")),
@@ -230,7 +307,17 @@ impl FolderBrowser {
             selection,
             tree_model,
             selected_callback,
+            delete_callback,
         }
+    }
+
+    /// Called when a row's trash button is clicked. The browser only reports
+    /// the request; confirming and deleting is the caller's job.
+    pub fn connect_delete_requested<F>(&self, callback: F)
+    where
+        F: Fn(DeleteRequest) + 'static,
+    {
+        *self.delete_callback.borrow_mut() = Some(Box::new(callback));
     }
 
     pub fn load_tree(&self, tree: &DocumentTree) {
@@ -378,5 +465,33 @@ mod tests {
         nb.children.push(node("c", "stray", "DocumentType", None, None));
         let t = TreeItem::from_node(&nb);
         assert!(t.children.is_empty());
+    }
+
+    #[test]
+    fn only_documents_get_a_delete_request() {
+        let nb = TreeItem::from_node(&node("nb-1", "Church", "DocumentType", None, Some(1)));
+        let folder = TreeItem::from_node(&node("f-1", "Work", "CollectionType", None, None));
+        let pdf = TreeItem::from_node(&node("p-1", "Paper", "DocumentType", Some("pdf"), Some(3)));
+        assert_eq!(
+            DeleteRequest::for_item(&nb),
+            Some(DeleteRequest { uuid: "nb-1".into(), name: "Church".into() })
+        );
+        assert_eq!(DeleteRequest::for_item(&folder), None);
+        assert!(DeleteRequest::for_item(&pdf).is_some());
+    }
+
+    #[test]
+    fn request_keeps_the_name_exactly_as_displayed() {
+        let dup = TreeItem::from_node(&node(
+            "d-1",
+            "Home Designs (conflict 2026-10-02)",
+            "DocumentType",
+            None,
+            Some(2),
+        ));
+        assert_eq!(
+            DeleteRequest::for_item(&dup).unwrap().name,
+            "Home Designs (conflict 2026-10-02)"
+        );
     }
 }
