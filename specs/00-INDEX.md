@@ -49,6 +49,9 @@ LAYER 8 — Real-Device Fixes (post-first-sync)
   26-content-v2-parser ──── (critical, blocks viewer)
   27-viewer-error-handling ── (depends on 26)
   28-self-contained-svg-rendering ── (depends on 26)
+
+LAYER 9 — Library management
+  29-delete-notebook ── (depends on 11, 16, 22; builds on MCC-109 safeguards)
 ```
 
 ## Parallelization Opportunities

@@ -44,6 +44,15 @@ CREATE TABLE IF NOT EXISTS sync_log (
 CREATE INDEX IF NOT EXISTS idx_log_uuid ON sync_log(uuid);
 CREATE INDEX IF NOT EXISTS idx_log_timestamp ON sync_log(timestamp);
 
+-- Documents the user deleted on purpose and whose removal from the device is
+-- still owed. Overrides the diff so the document is neither re-pulled nor
+-- treated as an ordinary missing file, and survives an unreachable device.
+CREATE TABLE IF NOT EXISTS pending_deletes (
+    uuid            TEXT PRIMARY KEY,
+    visible_name    TEXT NOT NULL,
+    requested_at    INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS schema_version (
     version         INTEGER PRIMARY KEY
 );
@@ -78,6 +87,14 @@ impl SyncStatus {
             other => Err(anyhow!("unknown sync_status value: {other}")),
         }
     }
+}
+
+/// A user-requested delete whose device side is still outstanding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingDelete {
+    pub uuid: String,
+    pub name: String,
+    pub requested_at: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +257,34 @@ impl StateDb {
         self.conn
             .execute("DELETE FROM sync_state WHERE uuid = ?1", params![uuid])
             .with_context(|| format!("deleting sync_state for uuid {uuid}"))?;
+        Ok(())
+    }
+
+    /// Record that the user deleted `uuid`; the device copy is still to go.
+    pub fn add_pending_delete(&self, uuid: &str, name: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO pending_deletes (uuid, visible_name, requested_at) VALUES (?1, ?2, ?3)",
+                params![uuid, name, now_ms()],
+            )
+            .with_context(|| format!("recording pending delete of {uuid}"))?;
+        Ok(())
+    }
+
+    pub fn pending_deletes(&self) -> Result<Vec<PendingDelete>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT uuid, visible_name, requested_at FROM pending_deletes ORDER BY requested_at, uuid")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PendingDelete { uuid: r.get(0)?, name: r.get(1)?, requested_at: r.get(2)? })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn clear_pending_delete(&self, uuid: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM pending_deletes WHERE uuid = ?1", params![uuid])
+            .with_context(|| format!("clearing pending delete of {uuid}"))?;
         Ok(())
     }
 

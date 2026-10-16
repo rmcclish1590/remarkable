@@ -5,3 +5,4 @@ pub mod engine;
 pub mod scanner;
 pub mod state_db;
 pub mod transfer;
+pub mod user_delete;

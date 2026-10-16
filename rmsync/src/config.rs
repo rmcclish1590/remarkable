@@ -17,6 +17,9 @@ const APP_CONFIG_SUBDIR: &str = "rmsync";
 const SYNC_RAW: &str = "raw";
 const SYNC_META: &str = ".rmsync";
 
+fn default_backup_retention_days() -> u32 {
+    30
+}
 fn default_true() -> bool {
     true
 }
@@ -61,6 +64,10 @@ pub struct SyncConfig {
     /// device, so new and changed documents appear. Never reboots the device.
     #[serde(default = "default_true")]
     pub restart_device_ui: bool,
+    /// How long backups of deleted documents are kept before being pruned.
+    /// 0 keeps them forever.
+    #[serde(default = "default_backup_retention_days")]
+    pub deleted_backup_retention_days: u32,
 }
 
 impl Default for SyncConfig {
@@ -70,6 +77,7 @@ impl Default for SyncConfig {
             auto_sync_on_connect: false,
             confirm_deletes: true,
             restart_device_ui: true,
+            deleted_backup_retention_days: default_backup_retention_days(),
         }
     }
 }
@@ -232,6 +240,7 @@ mod tests {
         assert_eq!(c.device.timeout_secs, 5);
         assert!(c.sync.confirm_deletes);
         assert!(c.sync.restart_device_ui);
+        assert_eq!(c.sync.deleted_backup_retention_days, 30);
         assert!(!c.sync.auto_sync_on_connect);
         assert_eq!(c.ui.window_width, 1200);
         assert_eq!(c.ui.window_height, 800);

@@ -633,10 +633,17 @@ fn state_after_push(
 
 /// Delete every remote file for `uuid` on the reMarkable.
 pub async fn delete_remote_document(conn: &DeviceConnection, uuid: &str) -> Result<()> {
+    anyhow::ensure!(is_safe_uuid(uuid), "refusing to delete unsafe uuid {uuid:?}");
     let entries = conn.list_dir(XOCHITL_PATH).await?;
     let subdir = format!("{XOCHITL_PATH}/{uuid}");
     if let Ok(children) = conn.list_dir(&subdir).await {
+        // Every file about to go must be this document's own.
+        verify_file_set(
+            uuid,
+            children.iter().map(|c| format!("{uuid}/{}", c.name)),
+        )?;
         for child in children {
+            tracing::debug!(uuid, file = %child.path, "removing file from device");
             let _ = conn.delete_file(&child.path).await;
         }
         let _ = conn
@@ -645,10 +652,27 @@ pub async fn delete_remote_document(conn: &DeviceConnection, uuid: &str) -> Resu
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()));
     }
-    for e in entries {
-        if e.name.starts_with(&format!("{uuid}.")) {
-            let _ = conn.delete_file(&e.path).await;
-        }
+    let own: Vec<_> = entries
+        .into_iter()
+        .filter(|e| e.name.starts_with(&format!("{uuid}.")))
+        .collect();
+    verify_file_set(uuid, own.iter().map(|e| e.name.clone()))?;
+    for e in own {
+        tracing::debug!(uuid, file = %e.path, "removing file from device");
+        let _ = conn.delete_file(&e.path).await;
+    }
+    // Individual deletes above are best-effort; confirm the document is really
+    // gone so the caller never records a delete that did not happen (which
+    // would let the next sync pull the document straight back).
+    let left: Vec<String> = conn
+        .list_dir(XOCHITL_PATH)
+        .await?
+        .into_iter()
+        .filter(|e| e.name == uuid || e.name.starts_with(&format!("{uuid}.")))
+        .map(|e| e.name)
+        .collect();
+    if !left.is_empty() {
+        anyhow::bail!("{} item(s) for {uuid} are still on the device: {}", left.len(), left.join(", "));
     }
     Ok(())
 }
@@ -828,6 +852,33 @@ pub async fn backup_and_delete_remote_document(
     delete_remote_document(conn, uuid).await
 }
 
+/// Check that every path in `rels` (relative to the document directory, as
+/// laid out under `raw/`) belongs to `uuid`: either `<uuid>.<ext>` or one file
+/// directly inside `<uuid>/`. Anything else aborts, so a delete can never
+/// reach beyond the one document it was asked to remove.
+pub(crate) fn verify_file_set<I, S>(uuid: &str, rels: I) -> Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    for rel in rels {
+        let rel = rel.as_ref();
+        let own_file = rel
+            .strip_prefix(uuid)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .is_some_and(|ext| !ext.is_empty() && !ext.contains(['/', '\\']));
+        let page = rel
+            .strip_prefix(uuid)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(|name| !name.is_empty() && name != ".." && !name.contains(['/', '\\']));
+        anyhow::ensure!(
+            own_file || page,
+            "refusing to delete: {rel:?} does not belong to document {uuid}"
+        );
+    }
+    Ok(())
+}
+
 /// Root of all conflict backups. Lives beside the state DB, outside `raw/`.
 pub fn backup_root(sync_dir: &Path) -> PathBuf {
     sync_dir.join(".rmsync").join("backups")
@@ -835,7 +886,7 @@ pub fn backup_root(sync_dir: &Path) -> PathBuf {
 
 /// Copy every local file for `uuid` into `backup_dir`, keeping the names and
 /// layout they have under `raw/`.
-fn copy_local_to_backup(raw: &Path, uuid: &str, backup_dir: &Path) -> Result<()> {
+pub(crate) fn copy_local_to_backup(raw: &Path, uuid: &str, backup_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(backup_dir)?;
     for (path, rel) in local_files_for_uuid(raw, uuid)? {
         let dest = backup_dir.join(&rel);
@@ -1297,5 +1348,16 @@ mod tests {
         std::fs::write(raw.join("keep.metadata"), b"x").unwrap();
         assert!(backup_and_delete_local_document("../raw", dir.path(), &backup).is_err());
         assert!(raw.join("keep.metadata").exists());
+    }
+
+    #[test]
+    fn file_set_check_accepts_only_the_documents_own_files() {
+        let ok = ["u1.metadata", "u1.content", "u1.pdf", "u1/p1.rm", "u1/p1-metadata.json"];
+        assert!(verify_file_set("u1", ok).is_ok());
+        for bad in ["u2.metadata", "u10.metadata", "u1", "u1.", "u1/", "u1/../u2/p.rm", "u1/a/b.rm", "../u1.metadata", "u1.x/y"] {
+            assert!(verify_file_set("u1", [bad]).is_err(), "{bad:?} must be rejected");
+        }
+        // One stray file poisons the whole set.
+        assert!(verify_file_set("u1", ["u1.metadata", "other.metadata"]).is_err());
     }
 }

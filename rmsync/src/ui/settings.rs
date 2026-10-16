@@ -114,7 +114,8 @@ pub fn present_settings(
 
 /// "Device" group: whether a sync that changed the tablet restarts its screen.
 fn device_group(config: Rc<RefCell<AppConfig>>) -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::builder().title("Device").build();
+    let config_for_days = config.clone();
+    let group = adw::PreferencesGroup::builder().title("Device and backups").build();
     let row = adw::ActionRow::builder()
         .title("Refresh the reMarkable screen after changes")
         .subtitle(
@@ -141,6 +142,29 @@ fn device_group(config: Rc<RefCell<AppConfig>>) -> adw::PreferencesGroup {
         }
     });
     group.add(&row);
+
+    let retention = adw::ActionRow::builder()
+        .title("Keep backups of deleted notebooks")
+        .subtitle(
+            "Days to keep the copy made when you delete a notebook, before it is removed \
+             for good. 0 keeps them forever. Backups are in the sync folder under \
+             .rmsync/backups/user-deleted.",
+        )
+        .build();
+    let days = gtk::SpinButton::with_range(0.0, 3650.0, 1.0);
+    days.set_valign(gtk::Align::Center);
+    days.set_value(config_for_days.borrow().sync.deleted_backup_retention_days as f64);
+    days.connect_value_changed(move |sb| {
+        let mut cfg = config_for_days.borrow_mut();
+        cfg.sync.deleted_backup_retention_days = sb.value() as u32;
+        if let Err(e) = cfg.save() {
+            tracing::error!(error = format!("{e:#}"), "could not save backup retention");
+        } else {
+            tracing::info!(days = sb.value() as u32, "backup retention saved");
+        }
+    });
+    retention.add_suffix(&days);
+    group.add(&retention);
     group
 }
 
