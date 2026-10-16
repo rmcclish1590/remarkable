@@ -80,9 +80,13 @@ impl RmSyncApp {
                 log_handle.clone(),
             );
             load_folder_tree(&main.folder_browser, &cfg);
-            main.folder_browser.connect_delete_requested(|request| {
-                // The confirmation dialog (MCC-114) takes over from here.
+            let window_for_delete = main.window.clone();
+            main.folder_browser.connect_delete_requested(move |request| {
                 tracing::info!(uuid = %request.uuid, name = %request.name, "delete requested from the list");
+                crate::ui::delete_dialog::present_delete_dialog(&window_for_delete, request, |confirmed| {
+                    // Hand-off point for the delete flow (MCC-115).
+                    tracing::info!(uuid = %confirmed.uuid, name = %confirmed.name, "delete confirmed");
+                });
             });
             wire_folder_browser_to_viewer(
                 &main.folder_browser,
