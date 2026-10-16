@@ -80,6 +80,10 @@ impl RmSyncApp {
                 log_handle.clone(),
             );
             load_folder_tree(&main.folder_browser, &cfg);
+            main.folder_browser.connect_delete_requested(|request| {
+                // The confirmation dialog (MCC-114) takes over from here.
+                tracing::info!(uuid = %request.uuid, name = %request.name, "delete requested from the list");
+            });
             wire_folder_browser_to_viewer(
                 &main.folder_browser,
                 &main.viewer,
