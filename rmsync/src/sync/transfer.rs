@@ -399,18 +399,46 @@ pub async fn push_document(
         let _ = conn.mkdir(&subdir_remote).await;
     }
 
-    let mut transferred = 0usize;
+    // Metadata goes last: xochitl lists a document by its `.metadata`, so a
+    // document that fails half-way is never presented as a complete one.
+    let ordered = upload_order(&local_files);
+
+    // Phase 1: upload everything beside its destination as `<name>.tmp`. Any
+    // failure here removes every temp file and leaves the device untouched.
+    let mut staged: Vec<String> = Vec::new();
     let mut bytes = 0u64;
-    let mut first_err: Option<String> = None;
-    for (local_path, rel) in &local_files {
+    for (local_path, rel) in &ordered {
         let remote_path = format!("{XOCHITL_PATH}/{rel}");
-        match upload_atomic(conn, local_path, &remote_path).await {
+        match stage_upload(conn, local_path, &remote_path).await {
             Ok(n) => {
-                transferred += 1;
                 bytes += n;
+                staged.push(remote_path);
             }
             Err(e) => {
-                first_err.get_or_insert_with(|| format!("{}: {e}", remote_path));
+                let first_err = format!("{remote_path}: {e}");
+                for done in staged.iter().chain(std::iter::once(&remote_path)) {
+                    let _ = conn.delete_file(&format!("{done}.tmp")).await;
+                }
+                return Ok(PushResult {
+                    uuid: uuid.into(),
+                    files_transferred: 0,
+                    bytes_transferred: 0,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    success: false,
+                    error: Some(first_err),
+                });
+            }
+        }
+    }
+
+    // Phase 2: move each staged file into place.
+    let mut transferred = 0usize;
+    let mut first_err: Option<String> = None;
+    for remote_path in &staged {
+        match commit_upload(conn, remote_path).await {
+            Ok(()) => transferred += 1,
+            Err(e) => {
+                first_err.get_or_insert_with(|| format!("{remote_path}: {e}"));
                 let _ = conn.delete_file(&format!("{remote_path}.tmp")).await;
             }
         }
@@ -426,21 +454,34 @@ pub async fn push_document(
     })
 }
 
-async fn upload_atomic(
-    conn: &DeviceConnection,
-    local_path: &Path,
-    remote_path: &str,
-) -> Result<u64> {
-    let tmp_remote = format!("{remote_path}.tmp");
+/// Files in upload order: everything else first, `.metadata` last.
+fn upload_order(files: &[(PathBuf, String)]) -> Vec<&(PathBuf, String)> {
+    let mut ordered: Vec<_> = files.iter().collect();
+    ordered.sort_by_key(|(_, rel)| rel.ends_with(".metadata"));
+    ordered
+}
+
+/// Upload `local_path` to `<remote_path>.tmp`.
+async fn stage_upload(conn: &DeviceConnection, local_path: &Path, remote_path: &str) -> Result<u64> {
     let data = tokio::fs::read(local_path).await?;
-    conn.write_file(&tmp_remote, &data).await?;
-    // russh-sftp has no atomic-rename helper on SftpSession; use its underlying
-    // raw client by calling rename via the session (available as sftp.rename).
-    conn.sftp()?
-        .rename(&tmp_remote, remote_path)
-        .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    conn.write_file(&format!("{remote_path}.tmp"), &data).await?;
     Ok(data.len() as u64)
+}
+
+/// Move `<remote_path>.tmp` onto `remote_path`. SFTP v3 rename refuses to
+/// replace an existing file, so when the document is already on the device
+/// the old file is removed first; the staged copy is kept until the rename
+/// succeeds, so a failure here never loses both versions.
+async fn commit_upload(conn: &DeviceConnection, remote_path: &str) -> Result<()> {
+    let tmp = format!("{remote_path}.tmp");
+    let sftp = conn.sftp()?;
+    if sftp.rename(&tmp, remote_path).await.is_ok() {
+        return Ok(());
+    }
+    let _ = conn.delete_file(remote_path).await;
+    sftp.rename(&tmp, remote_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("moving the uploaded file into place: {e}"))
 }
 
 pub(crate) fn local_files_for_uuid(raw: &Path, uuid: &str) -> Result<Vec<(PathBuf, String)>> {
@@ -762,6 +803,31 @@ pub async fn execute_conflict_resolution(
     Ok(())
 }
 
+/// Copy `uuid`'s local files into `backup_dir`, then remove them from `raw/`.
+/// If the backup fails nothing is removed.
+pub fn backup_and_delete_local_document(uuid: &str, sync_dir: &Path, backup_dir: &Path) -> Result<()> {
+    if !is_safe_uuid(uuid) {
+        anyhow::bail!("refusing to delete unsafe uuid {uuid:?}");
+    }
+    copy_local_to_backup(&sync_dir.join(RAW_SUBDIR), uuid, backup_dir)?;
+    delete_local_document(uuid, sync_dir)
+}
+
+/// Download the device's copy of `uuid` into `backup_dir`, then delete it from
+/// the device. If the backup fails nothing is deleted.
+pub async fn backup_and_delete_remote_document(
+    conn: &DeviceConnection,
+    uuid: &str,
+    sync_dir: &Path,
+    backup_dir: &Path,
+) -> Result<()> {
+    if !is_safe_uuid(uuid) {
+        anyhow::bail!("refusing to delete unsafe uuid {uuid:?}");
+    }
+    download_remote_to_backup(conn, uuid, &sync_dir.join(RAW_SUBDIR), backup_dir).await?;
+    delete_remote_document(conn, uuid).await
+}
+
 /// Root of all conflict backups. Lives beside the state DB, outside `raw/`.
 pub fn backup_root(sync_dir: &Path) -> PathBuf {
     sync_dir.join(".rmsync").join("backups")
@@ -813,24 +879,26 @@ async fn download_remote_to_backup(
 /// Measure the device clock minus the desktop clock, in seconds.
 ///
 /// Writes a throwaway file in the device's `/tmp` and reads back the mtime the
-/// device stamped on it, which is the device clock's "now". Returns `None`
-/// (callers treat as 0) if the probe can't run; resolution still works, just
-/// without skew compensation.
-pub async fn estimate_clock_offset(conn: &DeviceConnection) -> Option<i64> {
+/// device stamped on it, which is the device clock's "now". On failure the
+/// error says which step failed; callers fall back to an offset of 0 (times
+/// compared as-is) and should say so.
+pub async fn estimate_clock_offset(conn: &DeviceConnection) -> Result<i64> {
     const PROBE: &str = "/tmp/rmsync-clock-probe";
     let before = now_secs();
-    conn.write_file(PROBE, b"").await.ok()?;
-    let device_now = conn
-        .list_dir("/tmp")
+    conn.write_file(PROBE, b"")
         .await
-        .ok()
-        .and_then(|e| e.into_iter().find(|f| f.path == PROBE))
-        .map(|f| f.mtime);
+        .context("writing the probe file to the device's /tmp")?;
+    let listed = conn.list_dir("/tmp").await;
     let _ = conn.delete_file(PROBE).await;
-    let device_now = device_now?;
+    let device_now = listed
+        .context("listing the device's /tmp")?
+        .into_iter()
+        .find(|f| f.path == PROBE)
+        .map(|f| f.mtime)
+        .context("probe file missing from the device's /tmp listing")?;
     let offset = clock_offset(device_now, before, now_secs());
     tracing::debug!(device_now, offset_secs = offset, "measured device clock offset");
-    Some(offset)
+    Ok(offset)
 }
 
 /// Offset given the device's stamp and the desktop clock either side of the
@@ -883,6 +951,7 @@ pub async fn resolve_all_conflicts(
     remote_manifest: &RemoteManifest,
     sync_dir: &Path,
     db: &StateDb,
+    clock_offset: i64,
 ) -> (Vec<ConflictResolution>, Vec<String>) {
     let mut resolved = Vec::new();
     let mut errors = Vec::new();
@@ -896,13 +965,6 @@ pub async fn resolve_all_conflicts(
         .iter()
         .map(|d| (d.uuid.as_str(), d))
         .collect();
-    let clock_offset = match estimate_clock_offset(conn).await {
-        Some(o) => o,
-        None => {
-            tracing::warn!("could not measure device clock; comparing modified times as-is");
-            0
-        }
-    };
     for action in plan.conflicts() {
         let (Some(l), Some(r)) = (
             local_map.get(action.uuid.as_str()),
@@ -1202,5 +1264,38 @@ mod tests {
         assert!(validate_device_file("u.content", b"{}").is_ok());
         assert!(validate_device_file("u.content", b"").is_err());
         assert!(validate_device_file("u/p1.rm", b"\x00binary").is_ok(), "pages are not JSON");
+    }
+
+    #[test]
+    fn metadata_is_uploaded_last() {
+        let files = vec![
+            (PathBuf::from("a"), "u.metadata".to_string()),
+            (PathBuf::from("b"), "u.content".to_string()),
+            (PathBuf::from("c"), "u/p1.rm".to_string()),
+        ];
+        let order: Vec<&str> = upload_order(&files).iter().map(|(_, r)| r.as_str()).collect();
+        assert_eq!(order.last(), Some(&"u.metadata"));
+        assert_eq!(order.len(), 3);
+    }
+
+    #[test]
+    fn local_delete_keeps_a_backup_and_refuses_unsafe_uuids() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("raw");
+        std::fs::create_dir_all(raw.join("abc")).unwrap();
+        std::fs::write(raw.join("abc.metadata"), b"meta").unwrap();
+        std::fs::write(raw.join("abc/p1.rm"), b"page").unwrap();
+        let backup = backup_root(dir.path()).join("deleted-test/abc");
+
+        backup_and_delete_local_document("abc", dir.path(), &backup).unwrap();
+
+        assert!(!raw.join("abc.metadata").exists());
+        assert!(!raw.join("abc").exists());
+        assert_eq!(std::fs::read(backup.join("abc.metadata")).unwrap(), b"meta");
+        assert_eq!(std::fs::read(backup.join("abc/p1.rm")).unwrap(), b"page");
+
+        std::fs::write(raw.join("keep.metadata"), b"x").unwrap();
+        assert!(backup_and_delete_local_document("../raw", dir.path(), &backup).is_err());
+        assert!(raw.join("keep.metadata").exists());
     }
 }

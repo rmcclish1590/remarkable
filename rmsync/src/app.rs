@@ -213,6 +213,7 @@ pub(crate) fn wire_sync_button(
                 browser.clone(),
                 last_sync_label.clone(),
                 config.clone(),
+                false,
             );
         });
     });
@@ -224,6 +225,7 @@ fn start_sync(
     browser: FolderBrowser,
     last_sync_label: gtk::Label,
     config: Rc<RefCell<AppConfig>>,
+    approve_deletes: bool,
 ) {
     let cfg = config.borrow().clone();
     let (tx, rx) = async_channel::unbounded::<SyncProgressEvent>();
@@ -256,6 +258,9 @@ fn start_sync(
                     return;
                 }
             };
+            if approve_deletes {
+                orch.approve_deletes();
+            }
             let tx_inner = tx.clone();
             let _ = orch
                 .run_sync_with_progress(move |ev| {
@@ -308,6 +313,7 @@ fn start_sync(
                                 browser.clone(),
                                 label.clone(),
                                 config.clone(),
+                                false,
                             )
                         }
                     });
@@ -326,6 +332,27 @@ fn start_sync(
                     };
                     crate::ui::sync_controls::show_host_key_mismatch_dialog(
                         &window, change, known_hosts, retry.clone(), setup_new,
+                    );
+                }
+                SyncProgressEvent::DeleteConfirmationNeeded(deletes) => {
+                    let (window, controls, browser, label, config) = (
+                        window.clone(),
+                        controls.clone(),
+                        browser.clone(),
+                        last_sync_label.clone(),
+                        config.clone(),
+                    );
+                    crate::ui::sync_controls::show_delete_confirmation_dialog(
+                        &window.clone(),
+                        &deletes,
+                        move || start_sync(
+                            window.clone(),
+                            controls.clone(),
+                            browser.clone(),
+                            label.clone(),
+                            config.clone(),
+                            true,
+                        ),
                     );
                 }
                 SyncProgressEvent::Complete(report) => {

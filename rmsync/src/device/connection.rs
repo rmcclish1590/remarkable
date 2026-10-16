@@ -324,9 +324,19 @@ impl DeviceConnection {
             .map_err(|e| ConnectionError::SftpError(e.to_string()))
     }
 
+    /// Write `data` to `remote_path`, creating the file or truncating an
+    /// existing one. (`SftpSession::write` opens write-only without CREATE, so
+    /// it fails with "No such file" for any path that does not exist yet.)
     pub async fn write_file(&self, remote_path: &str, data: &[u8]) -> Result<(), ConnectionError> {
         let sftp = self.sftp()?;
-        sftp.write(remote_path, data)
+        let mut file = sftp
+            .create(remote_path)
+            .await
+            .map_err(|e| ConnectionError::SftpError(e.to_string()))?;
+        file.write_all(data)
+            .await
+            .map_err(|e| ConnectionError::SftpError(e.to_string()))?;
+        file.shutdown()
             .await
             .map_err(|e| ConnectionError::SftpError(e.to_string()))
     }
