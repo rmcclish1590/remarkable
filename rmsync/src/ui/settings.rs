@@ -1,4 +1,4 @@
-//! Settings dialog — currently the logging controls (spec: MCC-50).
+//! Settings dialog — logging (MCC-50, MCC-131), device, connection and library.
 //!
 //! The level applies the moment it is picked (no restart, no OK button)
 //! and is written to the config file so it survives one. The dialog also
@@ -7,8 +7,10 @@
 //! someone the log.
 
 use std::cell::RefCell;
+use std::path::Path;
 use std::rc::Rc;
 
+use gtk::glib;
 use gtk::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
@@ -17,6 +19,7 @@ use crate::config::AppConfig;
 use crate::sync::cleanup;
 use crate::sync::state_db::StateDb;
 use crate::logging::{LogHandle, LogLevel, MAX_LOG_BYTES, MAX_LOG_FILES};
+use crate::ui::log_viewer;
 
 /// Build and present the settings dialog.
 pub fn present_settings(
@@ -82,16 +85,7 @@ pub fn present_settings(
     group.add(&row);
 
     // Where the log lives, and how big it is allowed to get.
-    let location = adw::ActionRow::builder()
-        .title("Log file")
-        .subtitle(
-            log_handle
-                .path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "Not available — logging to terminal only".to_string()),
-        )
-        .build();
-    group.add(&location);
+    group.add(&log_file_row(&window, log_handle.path()));
 
     let limits = adw::ActionRow::builder()
         .title("Retention")
@@ -110,6 +104,36 @@ pub fn present_settings(
     page.add(&library_group(&window, config));
     window.add(&page);
     window.present();
+}
+
+/// The log file's full path, with a button that opens a read-only copy of it
+/// in the default text viewer (MCC-131). Activating the row (click, Enter or
+/// Space) presses the button.
+fn log_file_row(window: &adw::PreferencesWindow, path: Option<&Path>) -> adw::ActionRow {
+    let row = adw::ActionRow::builder().title("Log file").build();
+    let Some(path) = path else {
+        row.set_subtitle("Not available — logging to terminal only");
+        return row;
+    };
+    // Subtitles are markup; a path may contain '&' or '<'.
+    row.set_subtitle(&format!(
+        "{}\nOpens a read-only copy; the newest entries are at the bottom.",
+        glib::markup_escape_text(&path.display().to_string())
+    ));
+    row.set_tooltip_text(Some(log_viewer::OPEN_TOOLTIP));
+
+    let button = gtk::Button::builder()
+        .label("Open…")
+        .valign(gtk::Align::Center)
+        .tooltip_text(log_viewer::OPEN_TOOLTIP)
+        .build();
+    button.update_property(&[gtk::accessible::Property::Label(log_viewer::OPEN_TOOLTIP)]);
+    row.add_suffix(&button);
+    row.set_activatable_widget(Some(&button));
+
+    let (window, path) = (window.clone(), path.to_path_buf());
+    button.connect_clicked(move |b| log_viewer::open_log_file(&window, b, path.clone()));
+    row
 }
 
 /// "Device" group: whether a sync that changed the tablet restarts its screen.
