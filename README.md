@@ -119,6 +119,8 @@ Open the gear icon in the header bar to change how much is recorded. The setting
 
 To capture a problem: set **Debug**, reproduce it, then send the log file.
 
+To read the log, click **Open…** next to *Log file* in the same dialog. It opens a read-only copy in your default text editor (newest entries at the bottom), so nothing you do there can damage the live log. If no editor can be launched, the dialog shows the path and offers to copy it.
+
 The log rotates at 5 MB, keeping 5 previous files (`rmsync.log.1` … `.5`). Two environment variables override the defaults:
 
 ```bash
