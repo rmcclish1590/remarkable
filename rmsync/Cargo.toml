@@ -1,6 +1,6 @@
 [package]
 name = "rmsync"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Bi-directional sync for reMarkable 2 tablets on Linux"
 license = "MIT"

@@ -73,8 +73,8 @@ impl RmSyncApp {
             let cfg = config_for_activate.borrow().clone();
             tracing::debug!("building main window");
             let main = MainWindow::new(app, &cfg);
-            wire_settings_button(
-                &main.settings_button,
+            wire_settings_action(
+                &main.settings_action,
                 &main.window,
                 config_for_activate.clone(),
                 log_handle.clone(),
@@ -147,14 +147,14 @@ impl RmSyncApp {
     }
 }
 
-fn wire_settings_button(
-    button: &gtk::Button,
+fn wire_settings_action(
+    action: &gtk::gio::SimpleAction,
     window: &adw::ApplicationWindow,
     config: Rc<RefCell<AppConfig>>,
     log_handle: LogHandle,
 ) {
     let window = window.clone();
-    button.connect_clicked(move |_| {
+    action.connect_activate(move |_, _| {
         tracing::debug!("opening settings");
         crate::ui::settings::present_settings(&window, config.clone(), log_handle.clone());
     });

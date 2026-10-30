@@ -20,7 +20,7 @@ fn main() -> std::process::ExitCode {
     let handle = logging::init(level);
 
     tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
+        version = rmsync::version::VERSION,
         log_level = level.as_str(),
         log_file = handle.path().map(|p| p.display().to_string()),
         config_file = %AppConfig::config_path().display(),

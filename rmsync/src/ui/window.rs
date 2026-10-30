@@ -1,9 +1,10 @@
 //! Main application window (root of the widget tree).
 //!
-//! Three-panel layout: an `adw::HeaderBar` up top with device status and sync
-//! button placeholders, a toolbar row with the sync-destination entry and
-//! browse button, and a resizable `GtkPaned` splitting sidebar/viewer.
+//! Three-panel layout: an `adw::HeaderBar` up top with device status, the
+//! sync button and the main menu, a toolbar row with the sync-destination
+//! entry and browse button, and a resizable `GtkPaned` splitting sidebar/viewer.
 
+use gtk::gio;
 use gtk::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
@@ -20,7 +21,9 @@ const MIN_VIEWER_WIDTH: i32 = 400;
 pub struct MainWindow {
     pub window: adw::ApplicationWindow,
     pub header_bar: adw::HeaderBar,
-    pub settings_button: gtk::Button,
+    pub menu_button: gtk::MenuButton,
+    /// `win.settings`, activated by the menu's Settings entry.
+    pub settings_action: gio::SimpleAction,
     pub sync_path_entry: gtk::Entry,
     pub browse_button: gtk::Button,
     pub last_sync_label: gtk::Label,
@@ -47,13 +50,10 @@ impl MainWindow {
         let header_bar = adw::HeaderBar::builder()
             .title_widget(&gtk::Label::builder().label("rmSync").build())
             .build();
-        let settings_button = gtk::Button::builder()
-            .icon_name("emblem-system-symbolic")
-            .tooltip_text("Settings")
-            .build();
+        let (menu_button, settings_action) = main_menu(&window);
         header_bar.pack_start(&device_status.widget);
         header_bar.pack_end(&sync_controls.sync_button);
-        header_bar.pack_end(&settings_button);
+        header_bar.pack_end(&menu_button);
 
         let toolbar = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -119,7 +119,8 @@ impl MainWindow {
         Self {
             window,
             header_bar,
-            settings_button,
+            menu_button,
+            settings_action,
             sync_path_entry,
             browse_button,
             last_sync_label,
@@ -162,6 +163,32 @@ fn format_unix_time(ts: u64) -> String {
     let h = secs_of_day / 3600;
     let mi = (secs_of_day % 3600) / 60;
     format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}")
+}
+
+/// The header-bar menu: Settings, with the app version beneath it as a
+/// read-only entry. The version entry points at an action that is never
+/// enabled, which GTK renders as an insensitive, unclickable item.
+fn main_menu(window: &adw::ApplicationWindow) -> (gtk::MenuButton, gio::SimpleAction) {
+    let settings_action = gio::SimpleAction::new("settings", None);
+    window.add_action(&settings_action);
+    let version_action = gio::SimpleAction::new("version", None);
+    version_action.set_enabled(false);
+    window.add_action(&version_action);
+
+    let actions = gio::Menu::new();
+    actions.append(Some("Settings"), Some("win.settings"));
+    let about = gio::Menu::new();
+    about.append(Some(&crate::version::display_label()), Some("win.version"));
+    let menu = gio::Menu::new();
+    menu.append_section(None, &actions);
+    menu.append_section(None, &about);
+
+    let button = gtk::MenuButton::builder()
+        .icon_name("emblem-system-symbolic")
+        .tooltip_text("Menu")
+        .menu_model(&menu)
+        .build();
+    (button, settings_action)
 }
 
 #[cfg(test)]

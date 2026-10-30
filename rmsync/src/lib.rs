@@ -10,3 +10,4 @@ pub mod logging;
 pub mod remarkable;
 pub mod sync;
 pub mod ui;
+pub mod version;
