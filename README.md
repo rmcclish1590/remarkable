@@ -20,21 +20,34 @@ Remarkable connects to your reMarkable tablet to provide two-way data synchroniz
 
 ## Installation
 
-### Option A — Install the .deb package (recommended)
+### Option A — Build and install the .deb package (recommended)
 
-1. Build the package (see [Building the .deb package](#building-the-deb-package) below), or use a prebuilt `rmsync_<version>_amd64.deb` if you have one.
-2. Install it with the install script, which stages the package where apt's sandboxed `_apt` user can read it:
+1. Install the build dependencies from [Option B](#option-b--build-and-run-from-source) step 1, plus `cargo-deb`:
+
+   ```bash
+   cargo install cargo-deb
+   ```
+
+2. Run the install script from a source checkout. It builds a fresh package from the current source (release build, full test suite, `cargo deb`) and then installs exactly that package:
 
    ```bash
    cd rmsync
-   ./scripts/install-deb.sh                # installs the newest package from target/debian/
+   ./scripts/install-deb.sh
    ```
 
-   Or install a specific package file manually. If the `.deb` lives under your home directory, copy it to `/tmp` first — otherwise apt prints `N: Download unsandboxed as root ... Permission denied` because the sandboxed `_apt` user cannot read files under a private home directory:
+   - Every run rebuilds, so the installed app always matches the code you have checked out; a package left over from an earlier build is never reused.
+   - If any build step or test fails, the script stops before calling apt and your existing installation is left as it was.
+   - Re-running it over an existing install upgrades in place, even when the version number hasn't changed.
+   - It finishes by printing the installed version and the git commit it was built from.
+   - Your data is not part of the package and is kept across reinstalls: `~/.config/rmsync` (settings, SSH key, pinned host key), `~/.local/share/rmsync` (logs) and your sync directory, including its `.rmsync/` sync state and deleted-notebook backups.
+
+   To install a package you already have instead of building one, pass its path: `./scripts/install-deb.sh path/to/rmsync_<version>_amd64.deb`.
+
+   To install a package file manually, copy it out of your home directory first — otherwise apt prints `N: Download unsandboxed as root ... Permission denied` because the sandboxed `_apt` user cannot read files under a private home directory:
 
    ```bash
    cp rmsync_0.1.0-1_amd64.deb /tmp/
-   sudo apt install /tmp/rmsync_0.1.0-1_amd64.deb
+   sudo apt install --reinstall /tmp/rmsync_0.1.0-1_amd64.deb
    ```
 
    Installation adds the `rmsync` binary to `/usr/bin`, an application menu entry with icon, and a udev rule for tablet detection.
@@ -85,7 +98,7 @@ cd rmsync
 ./scripts/build-deb.sh
 ```
 
-The script builds the release binary, runs the full test suite, and produces the package at `rmsync/target/debian/rmsync_<version>_amd64.deb`. It then copies the package into a temp directory that apt's sandboxed `_apt` user can read, and prints a ready-to-run install command for that copy — packages left under your home directory trigger the `Permission denied` notice described above.
+The script builds the release binary, runs the full test suite, and produces the package at `rmsync/target/debian/rmsync_<version>_amd64.deb`. It then copies the package into a temp directory that apt's sandboxed `_apt` user can read, and prints a ready-to-run install command for that copy — packages left under your home directory trigger the `Permission denied` notice described above. Use this when you want the package file itself; `./scripts/install-deb.sh` runs the same build and installs the result in one step.
 
 ## Running the application
 
