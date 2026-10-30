@@ -96,4 +96,5 @@ Log to the target that matches the module — a message emitted from a non-`rmsy
 - **Never commit directly to `main`.** Always create a branch, push it, and open a PR.
 - Work is tracked in Linear under the McClish Products team (`MCC`), project "Remarkable". Linear supplies a branch name per issue — use it.
 - **One issue per branch/PR/merge/delete cycle.** Do not batch multiple issues onto one branch, even when they are related.
+- **Bump the version in every PR** with `cargo run --example bump_version -- small` (or `major` for a major update), and commit `Cargo.toml` and `Cargo.lock` together. The rules — +0.0.1 / +0.1.0, each of the last two numbers rolling over at 10 — are in `src/version.rs` and the README. `Cargo.toml` is the only place a version number may appear.
 - Set the issue to **In Progress when work starts**, before creating the branch. A merged PR whose body says `Closes MCC-NN` moves it to Done — verify that happened rather than assuming.

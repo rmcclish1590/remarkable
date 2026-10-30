@@ -117,11 +117,15 @@ Launch **rmSync** from the application menu (it appears under Utilities after in
 
 Settings are stored in `~/.config/rmsync/config.toml`, created with defaults on first run. Synced documents are stored in the sync folder chosen above.
 
+### Which version am I running?
+
+Open the gear menu in the header bar: the version (e.g. *Version 0.1.1*) is listed directly beneath **Settings**. It is also the `version` field on the `rmSync starting` line at the top of each run in the log, and `dpkg-query -W rmsync` shows the installed package version.
+
 ### Logging
 
 rmSync writes a log to `~/.local/share/rmsync/logs/rmsync.log`. It is the first thing to look at when something goes wrong, and the right thing to attach to a bug report.
 
-Open the gear icon in the header bar to change how much is recorded. The setting applies immediately — no restart — and is remembered:
+Open the gear menu in the header bar and choose **Settings** to change how much is recorded. The setting applies immediately — no restart — and is remembered:
 
 | Level | What it records |
 |---|---|
@@ -147,4 +151,24 @@ Run the test suite from the `rmsync` directory:
 
 ```bash
 cargo test
+```
+
+### Versioning
+
+The version lives in one place: `version` in `rmsync/Cargo.toml`. The app reads it at compile time (`rmsync::version::VERSION`) and the `.deb` takes its version from the same field, so never write a version number anywhere else.
+
+Every ticket that ships bumps the version, in the same PR:
+
+| Change | Bump | Example |
+|---|---|---|
+| Small ticket (the default) | +0.0.1 | `0.1.1` → `0.1.2` |
+| Major update | +0.1.0, last number reset to 0 | `0.1.4` → `0.2.0` |
+
+This is **not** semver: the last two numbers never go above 9. When one reaches 10 it resets to 0 and the number before it goes up by one — `0.0.9` → `0.1.0`, `0.9.9` → `1.0.0`. The first number keeps counting.
+
+Apply a bump with the helper, which edits `Cargo.toml` and refreshes `Cargo.lock`:
+
+```bash
+cd rmsync
+cargo run --example bump_version -- small   # or: major
 ```
