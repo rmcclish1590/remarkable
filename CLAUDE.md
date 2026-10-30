@@ -35,7 +35,7 @@ Packaging (`cargo install cargo-deb` first):
 
 ```bash
 ./scripts/build-deb.sh     # release build + tests + cargo deb, stages package in /tmp
-./scripts/install-deb.sh   # installs the newest build via apt
+./scripts/install-deb.sh   # builds a fresh package, then installs exactly that one via apt
 ```
 
 The scripts stage the `.deb` in a `mktemp -d` directory because apt's sandboxed `_apt` user cannot read files under a mode-750 home directory. Never substitute a fixed `/tmp` path — that path is handed to `sudo apt install`, and a predictable name in world-writable `/tmp` is hijackable.
